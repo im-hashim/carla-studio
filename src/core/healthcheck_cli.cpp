@@ -44,7 +44,7 @@ static CheckResult check_carla_rpc(const QString &host, int port) {
     const QString probe = run(
         QString("timeout 3 bash -c 'echo >>/dev/tcp/%1/%2' 2>&1").arg(host).arg(port), 5000);
     r.ok     = probe.isEmpty();
-    r.detail = r.ok ? "reachable" : "not reachable (start carla-studio start first)";
+    r.detail = r.ok ? "reachable (TCP)" : "not reachable (start carla-studio start first)";
     return r;
 }
 

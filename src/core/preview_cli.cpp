@@ -33,7 +33,7 @@ int carla_cli_preview_main(int argc, char **argv) {
         const QString envOutput = QString::fromLocal8Bit(rosSetup.readAllStandardOutput());
         for (const QString &line : envOutput.split('\n', Qt::SkipEmptyParts)) {
             const qsizetype eq = line.indexOf('=');
-            if (eq > 0) env.insert(line.left(eq), line.mid(eq + 1));
+            if (eq > 0) env.insert(line.left(static_cast<int>(eq)), line.mid(static_cast<int>(eq + 1)));
         }
     }
 
@@ -47,7 +47,7 @@ int carla_cli_preview_main(int argc, char **argv) {
                 const QString envOutput = QString::fromLocal8Bit(awSetup.readAllStandardOutput());
                 for (const QString &line : envOutput.split('\n', Qt::SkipEmptyParts)) {
                     const qsizetype eq = line.indexOf('=');
-                    if (eq > 0) env.insert(line.left(eq), line.mid(eq + 1));
+                    if (eq > 0) env.insert(line.left(static_cast<int>(eq)), line.mid(static_cast<int>(eq + 1)));
                 }
             }
         }

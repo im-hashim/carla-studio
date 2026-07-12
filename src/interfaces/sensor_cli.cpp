@@ -34,7 +34,7 @@ static void logErr(const QString &l) { err() << "[sensor] ERROR: " << l << "\n";
 // Matches the synthesizeLensCsv() presets in carla_studio.cpp
 static QString fisheye_config_json(const QString &model, double fov) {
     QJsonObject cfg;
-    cfg["sensor_type"]   = "sensor.camera.rgb";
+    cfg["sensor_type"]   = "sensor.camera.rgb_fisheye";
     cfg["image_size_x"]  = 800;
     cfg["image_size_y"]  = 450;
     cfg["fov"]           = fov;

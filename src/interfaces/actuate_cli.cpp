@@ -10,6 +10,10 @@
 //   carla-studio actuate sae-l2              Partial automation
 //   carla-studio actuate sae-l1 [--keyboard] Driver assistance (+ keyboard ego)
 //   carla-studio actuate sae-l0              No automation (manual)
+//   carla-studio actuate --backend libcarla|python
+//       Select the driver backend used by the UI (persisted in QSettings).
+//   carla-studio actuate --vehicle-blueprint <carla.blueprint.id>
+//       Select startup ego vehicle blueprint (same setting as homepage Vehicle dropdown).
 //
 // Persists the level to QSettings so the GUI reflects the selection on next open.
 
@@ -46,9 +50,39 @@ int carla_cli_actuate_main(int argc, char **argv) {
     const QString level_id = args.value(1).toLower();
 
     bool keyboard = args.contains("--keyboard");
+    int backendArg = static_cast<int>(args.indexOf("--backend"));
+    int vehicleArg = static_cast<int>(args.indexOf("--vehicle-blueprint"));
+    if (backendArg > 0 && backendArg + 1 < args.size()) {
+        const QString backend = args.value(backendArg + 1).trimmed().toLower();
+        if (backend != "libcarla" && backend != "python") {
+            err() << "Invalid backend: " << backend << "\n"
+                  << "Valid backends: libcarla python\n";
+            return 2;
+        }
+        QSettings settings;
+        settings.setValue("actuate/backend", backend);
+        settings.sync();
+        log(QString("Backend set to %1").arg(backend));
+        return 0;
+    }
+    if (vehicleArg > 0 && vehicleArg + 1 < args.size()) {
+        const QString blueprint = args.value(vehicleArg + 1).trimmed();
+        if (!blueprint.startsWith("vehicle.")) {
+            err() << "Invalid --vehicle-blueprint: " << blueprint << "\n"
+                  << "Expected a CARLA vehicle blueprint id (e.g. vehicle.lincoln.mkz_2017).\n";
+            return 2;
+        }
+        QSettings settings;
+        settings.setValue("vehicle/blueprint", blueprint);
+        settings.sync();
+        log(QString("Startup vehicle blueprint set to %1").arg(blueprint));
+        return 0;
+    }
 
     if (level_id.isEmpty()) {
         err() << "Usage: carla-studio actuate <sae-level> [--keyboard]\n"
+              << "       carla-studio actuate --backend libcarla|python\n"
+              << "       carla-studio actuate --vehicle-blueprint <carla.blueprint.id>\n"
               << "Levels: sae-l0  sae-l1  sae-l2  sae-l3  sae-l4  sae-l5\n";
         return 2;
     }
