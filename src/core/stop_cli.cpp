@@ -10,6 +10,8 @@
 #include <QTextStream>
 #include <QThread>
 
+#include <algorithm>
+
 #include <csignal>
 #include <sys/types.h>
 
@@ -87,8 +89,108 @@ int carla_cli_stop_main(int argc, char **argv) {
     const QStringList args = app.arguments();
 
     bool full = false;
+    QString remoteHost;
+    QString remoteUser;
+    QString remotePass;
+    QString remoteBindAddress;
     for (const QString &a : args)
         if (a == "--full" || a == "-f") full = true;
+
+    for (int i = 1; i < args.size(); ++i) {
+        const QString a = args[i];
+        if (a == "--remote-host" && i + 1 < args.size())
+            remoteHost = args[++i];
+        else if (a == "--remote-user" && i + 1 < args.size())
+            remoteUser = args[++i];
+        else if (a == "--remote-pass" && i + 1 < args.size())
+            remotePass = args[++i];
+        else if (a == "--remote-bind-address" && i + 1 < args.size())
+            remoteBindAddress = args[++i];
+    }
+
+    if (!remoteHost.isEmpty()) {
+        if (remoteUser.isEmpty()) {
+            log("--remote-user is required when --remote-host is set.");
+            return 2;
+        }
+
+        QStringList remote;
+        remote << "set -e";
+        remote << "SELF=$$";
+        remote << "PARENT=$PPID";
+        remote << "PIDFILE=\"$HOME/.config/carla-studio/carla-pids.txt\"";
+        remote << "PIDS=\"\"";
+        remote << "if [ -f \"$PIDFILE\" ]; then";
+        remote << "  while IFS= read -r line; do";
+        remote << "    case \"$line\" in ''|*[!0-9]*) continue;; esac";
+        remote << "    [ \"$line\" -eq \"$SELF\" ] && continue";
+        remote << "    [ \"$line\" -eq \"$PARENT\" ] && continue";
+        remote << "    [ \"$line\" -gt 1 ] && PIDS=\"$PIDS $line\"";
+        remote << "  done < \"$PIDFILE\"";
+        remote << "fi";
+        remote << "for p in $(pgrep -f 'CarlaUE[45]-Linux|UnrealEditor.*CarlaUnreal|CarlaUnreal-Linux-Shipping|CarlaUnreal\\.sh|CarlaUE[45]\\.sh' 2>/dev/null || true); do";
+        remote << "  [ \"$p\" -eq \"$SELF\" ] && continue";
+        remote << "  [ \"$p\" -eq \"$PARENT\" ] && continue";
+        remote << "  PIDS=\"$PIDS $p\"";
+        remote << "done";
+        remote << "if [ -z \"$PIDS\" ]; then";
+        remote << "  echo '[stop] No tracked CARLA processes found - nothing to stop.'";
+        remote << "else";
+        remote << "  echo '[stop] Sending SIGTERM...'";
+        remote << "  for p in $PIDS; do [ \"$p\" -eq \"$SELF\" ] && continue; [ \"$p\" -eq \"$PARENT\" ] && continue; kill -TERM \"$p\" 2>/dev/null && echo \"[stop]   SIGTERM -> PID $p\" || true; done";
+        remote << "  for _ in $(seq 1 30); do";
+        remote << "    alive=0";
+        remote << "    for p in $PIDS; do [ \"$p\" -eq \"$SELF\" ] && continue; [ \"$p\" -eq \"$PARENT\" ] && continue; kill -0 \"$p\" 2>/dev/null && alive=1; done";
+        remote << "    [ \"$alive\" -eq 0 ] && break";
+        remote << "    sleep 2";
+        remote << "  done";
+        remote << "  for p in $PIDS; do [ \"$p\" -eq \"$SELF\" ] && continue; [ \"$p\" -eq \"$PARENT\" ] && continue; kill -0 \"$p\" 2>/dev/null && kill -KILL \"$p\" 2>/dev/null && echo \"[stop]   SIGKILL -> PID $p\" || true; done";
+        remote << "  for p in $(pgrep -f 'CarlaUE4|CarlaUE5|CarlaUnreal' 2>/dev/null || true); do [ \"$p\" -eq \"$SELF\" ] && continue; [ \"$p\" -eq \"$PARENT\" ] && continue; kill -KILL \"$p\" 2>/dev/null && echo \"[stop]   SIGKILL (sweep) -> PID $p\" || true; done";
+        remote << "  rm -f \"$PIDFILE\"";
+        remote << "  echo '[stop] CARLA stopped.'";
+        remote << "fi";
+        if (full) {
+            remote << "echo '[stop] Stopping full stack extras...'";
+            remote << "docker stop carla-mcity-server 2>/dev/null || true";
+            remote << "docker rm carla-mcity-server 2>/dev/null || true";
+            remote << "docker ps -q --filter ancestor=carlasim/carla | xargs -r docker stop 2>/dev/null || true";
+            remote << "pkill -TERM -f 'terasim|TeraSim' 2>/dev/null || true";
+            remote << "pkill -TERM -f 'ros2|rviz|carla_av_ros2|carla_sensor_ros2|carla_cosim_ros2|gnss_decoder_fallback|planning_simulator_fallback' 2>/dev/null || true";
+            remote << "ros2 daemon stop 2>/dev/null || true";
+            remote << "pkill -TERM -f 'sumo-gui|sumo |libsumo|traci|terasim_examples|_example\\.py' 2>/dev/null || true";
+            remote << "docker network rm carla-net 2>/dev/null || true";
+            remote << "echo '[stop] Stack stopped.'";
+        }
+
+        QProcess p;
+        QString program = "ssh";
+        QStringList sshArgs;
+        if (!remotePass.isEmpty()) {
+            QProcess check;
+            check.start("/bin/sh", {"-c", "command -v sshpass"});
+            check.waitForFinished(2000);
+            if (check.exitCode() != 0) {
+                log("sshpass is required for --remote-pass but is not installed.");
+                return 2;
+            }
+            program = "sshpass";
+            sshArgs << "-p" << remotePass << "ssh";
+        }
+        if (!remoteBindAddress.trimmed().isEmpty())
+            sshArgs << "-o" << QString("BindAddress=%1").arg(remoteBindAddress.trimmed());
+        sshArgs << "-o" << "StrictHostKeyChecking=accept-new";
+        sshArgs << QString("%1@%2").arg(remoteUser, remoteHost);
+        sshArgs << remote.join("\n");
+
+        p.setProcessChannelMode(QProcess::ForwardedChannels);
+        p.start(program, sshArgs);
+        if (!p.waitForStarted(5000)) {
+            log("Failed to start SSH process.");
+            return 1;
+        }
+        p.waitForFinished(120000);
+        return p.exitCode();
+    }
 
     QList<qint64> pids = readTrackedPids();
     for (qint64 p : pgrepPids("'CarlaUE[45]-Linux|UnrealEditor.*CarlaUnreal|CarlaUnreal-Linux-Shipping|CarlaUnreal\\.sh|CarlaUE[45]\\.sh'")) {
