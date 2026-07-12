@@ -8,6 +8,7 @@
 
 #include <QCoreApplication>
 #include <QProcess>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QTextStream>

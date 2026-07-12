@@ -13,6 +13,8 @@
 #include <QJsonDocument>
 #include <QTcpSocket>
 
+#include <limits>
+
 namespace carla_studio::vehicle_import {
 
 namespace {
@@ -77,13 +79,15 @@ QString send_json(const QJsonObject &spec) {
                      | (static_cast<quint32>(rhdr[2]) << 16)
                      | (static_cast<quint32>(rhdr[3]) << 24);
   if (rlen == 0 || rlen > kMaxBody) return QString();
+  if (rlen > static_cast<quint32>(std::numeric_limits<int>::max())) return QString();
 
-  QByteArray body(rlen, 0);
+  QByteArray body(static_cast<int>(rlen), 0);
   qint64 got = 0;
   while (got < static_cast<qint64>(rlen)) {
     if (sock.bytesAvailable() <= 0 && !sock.waitForReadyRead(kIoTimeoutMs))
       return QString();
-    const qint64 r = sock.read(body.data() + got, rlen - got);
+    const qint64 r = sock.read(body.data() + got,
+                               static_cast<qint64>(rlen) - got);
     if (r <= 0) return QString();
     got += r;
   }

@@ -110,7 +110,9 @@ MeshAABB parse_gltf(const QString &path) {
                            | (static_cast<quint32>((quint8)raw[13]) << 8)
                            | (static_cast<quint32>((quint8)raw[14]) << 16)
                            | (static_cast<quint32>((quint8)raw[15]) << 24);
-    raw = raw.mid(20, chunkLen);
+    const int available = static_cast<int>(std::max(qsizetype{0}, raw.size() - 20));
+    const int boundedLen = std::min(static_cast<int>(chunkLen), available);
+    raw = raw.mid(20, boundedLen);
   }
 
   QJsonParseError err;

@@ -9,6 +9,7 @@
 #include "vehicle/import/editor_process.h"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -43,7 +44,7 @@ qint64 procStartUnix(qint64 pid) {
   if (data.isEmpty()) return 0;
   const qsizetype rparen = data.lastIndexOf(')');
   if (rparen < 0 || rparen + 2 >= data.size()) return 0;
-  const QList<QByteArray> rest = data.mid(rparen + 2).split(' ');
+  const QList<QByteArray> rest = data.mid(static_cast<int>(rparen + 2)).split(' ');
   if (rest.size() <= 19) return 0;
   bool ok = false;
   const qulonglong ticks = rest[19].toULongLong(&ok);

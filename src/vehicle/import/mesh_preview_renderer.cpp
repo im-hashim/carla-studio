@@ -200,7 +200,9 @@ QImage render_preview(const MeshGeometry &g,
       QPointF h1 = tip - dir * 16 + perp * 8;
       QPointF h2 = tip - dir * 16 - perp * 8;
       p.setBrush(col);
-      p.drawPolygon(QPolygonF{ tip, h1, h2 });
+      QPolygonF tri;
+      tri << tip << h1 << h2;
+      p.drawPolygon(tri);
     }
     p.setPen(col);
     QFont f = p.font(); f.setBold(true); p.setFont(f);

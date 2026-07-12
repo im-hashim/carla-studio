@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 #include "vehicle_preview_page.h"
-#include "view_gizmo.h"
 
 #ifndef CARLA_STUDIO_WITH_QT3D
 namespace carla_studio::vehicle_import {
@@ -42,10 +41,14 @@ void VehiclePreviewPage::mirror_y() {}
 void VehiclePreviewPage::recenter_mesh() {}
 void VehiclePreviewPage::reset_mesh_transform() {}
 void VehiclePreviewPage::apply_adjustment(const QString&) {}
+void VehiclePreviewPage::apply_to_spec() {}
+void VehiclePreviewPage::capture_window() {}
+bool VehiclePreviewPage::eventFilter(QObject *, QEvent *) { return false; }
 }
 #else
 
 #include "mesh_geometry.h"
+#include "view_gizmo.h"
 
 #include <QClipboard>
 #include <QDateTime>

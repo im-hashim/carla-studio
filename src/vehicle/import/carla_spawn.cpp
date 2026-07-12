@@ -52,7 +52,7 @@ QString contentSubpathForBp(const QString &bp_asset_path) {
   QString p = bp_asset_path;
   if (p.startsWith("/Game/")) p.remove(0, QString("/Game/").size());
   const qsizetype lastSlash = p.lastIndexOf('/');
-  return lastSlash > 0 ? p.left(lastSlash) : p;
+  return lastSlash > 0 ? p.left(static_cast<int>(lastSlash)) : p;
 }
 
 QString shippingContentRoot(const QString &shipping_carla_root) {
@@ -322,7 +322,8 @@ DeployResult deploy_vehicle_to_shipping_carla(const VehicleRegistration &reg) {
     const QString needle = QStringLiteral("/Content/");
     const qsizetype idx = cookedContentRoot.lastIndexOf(needle);
     if (idx >= 0)
-      cookedContentRoot = cookedContentRoot.left(idx + needle.size() - 1);
+      cookedContentRoot = cookedContentRoot.left(
+          static_cast<int>(idx + needle.size() - 1));
   }
   const QString vehicleRel = sub;
   QDirIterator it(cookedContentRoot,
@@ -381,8 +382,7 @@ SpawnResult spawn_in_running_carla(const QString &make, const QString &model,
   return sr;
 #else
   try {
-    auto client = carla::client::Client(host.toStdString(),
-                                        static_cast<uint16_t>(port));
+    auto client = carla::client::Client(host.toStdString(), static_cast<uint16_t>(port));
     client.SetTimeout(std::chrono::seconds(60));
     client.GetServerVersion();
     auto world  = client.GetWorld();
@@ -522,8 +522,7 @@ DriveTestResult drive_test_vehicle(const QString &make, const QString &model,
   return r;
 #else
   try {
-    auto client = carla::client::Client(host.toStdString(),
-                                        static_cast<uint16_t>(port));
+    auto client = carla::client::Client(host.toStdString(), static_cast<uint16_t>(port));
     client.SetTimeout(std::chrono::seconds(60));
     client.GetServerVersion();
     auto world = client.GetWorld();

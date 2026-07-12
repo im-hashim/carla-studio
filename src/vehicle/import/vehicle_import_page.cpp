@@ -45,6 +45,7 @@
 #include <QProcess>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QVector3D>
 #include <QSettings>
 #include <QDateTime>
 #include <QStandardPaths>
@@ -1047,7 +1048,7 @@ void VehicleImportPage::on_import() {
     capturedRR = QVector3D(m_detected_spec->wheels[3].x, m_detected_spec->wheels[3].y, m_detected_spec->wheels[3].z);
   }
 
-  auto sendNow = [=]() {
+  auto sendNow = [=, this]() {
     if (!log_ptr) return;
     log_ptr->appendPlainText(QString("[%1]  Sending spec to UE Editor…").arg(stamp()));
     if (statusPtr) statusPtr->setText("UE Editor: sending …");
@@ -1055,9 +1056,9 @@ void VehicleImportPage::on_import() {
       progressPtr->setRange(0, 0);
       progressPtr->setFormat("importing in UE Editor…");
     }
-    Q_UNUSED(QtConcurrent::run([=]() {
+    Q_UNUSED(QtConcurrent::run([=, this]() {
       const QString response = send_json(spec);
-      QMetaObject::invokeMethod(qApp, [=]() {
+      QMetaObject::invokeMethod(qApp, [=, this]() {
         if (!log_ptr) return;
         if (btn_ptr) btn_ptr->setEnabled(true);
         if (progressPtr) progressPtr->setRange(0, 100);
@@ -1242,7 +1243,7 @@ void VehicleImportPage::on_import() {
   const qint64 launchedPid = pid;
   auto *poll = new QTimer(this);
   poll->setInterval(1000);
-  connect(poll, &QTimer::timeout, this, [=]() {
+  connect(poll, &QTimer::timeout, this, [=, this]() {
     ++*attempts;
     if (probe_importer_port()) {
       poll->stop(); poll->deleteLater();
@@ -1317,7 +1318,7 @@ void VehicleImportPage::on_drop() {
   const QString            model     = reg.model;
 
   QPointer<QProgressBar> progPtr = m_progress;
-  Q_UNUSED(QtConcurrent::run([=]() {
+  Q_UNUSED(QtConcurrent::run([=, this]() {
     RegisterResult rr;
     DeployResult   dr;
     SpawnResult    sr;
@@ -1369,7 +1370,7 @@ void VehicleImportPage::on_drop() {
       unhandled = "unknown C++ exception";
     }
 
-    QMetaObject::invokeMethod(qApp, [=]() {
+    QMetaObject::invokeMethod(qApp, [=, this]() {
       if (!unhandled.isEmpty()) {
         if (log_ptr) log_ptr->appendPlainText(QString(
           "[%1]  Drive: caught %2 - likely API mismatch between this Studio's "
@@ -1464,18 +1465,18 @@ void VehicleImportPage::on_drop() {
               ::close(s);
               return up;
             };
-            connect(poll, &QTimer::timeout, this, [=]() {
+            connect(poll, &QTimer::timeout, this, [=, this]() {
               ++*attempts;
               const bool up = probePort2000();
               if (up) {
                 poll->stop(); poll->deleteLater();
                 if (logL) logL->appendPlainText(QString("[%1]  CARLA simulator is up after %2 s - retrying spawn.")
                                                   .arg(stamp()).arg(*attempts * 2));
-                Q_UNUSED(QtConcurrent::run([=]() {
+                Q_UNUSED(QtConcurrent::run([=, this]() {
                   SpawnResult sr2;
                   try { sr2 = spawn_in_running_carla(mk, md); }
                   catch (...) { sr2.detail = "second-pass spawn threw"; }
-                  QMetaObject::invokeMethod(qApp, [=]() {
+                  QMetaObject::invokeMethod(qApp, [=, this]() {
                     if (logL) logL->appendPlainText(QString("[%1]  Retry spawn: %2 - %3")
                                                       .arg(stamp())
                                                       .arg(sr2.kind == SpawnResult::Kind::Spawned ? "OK" : "FAIL")
@@ -1566,7 +1567,7 @@ void VehicleImportPage::on_export() {
   QPointer<QPlainTextEdit> log_ptr  = m_log;
   const QString            engineRoot = qEnvironmentVariable("CARLA_UNREAL_ENGINE_PATH");
 
-  Q_UNUSED(QtConcurrent::run([=]() {
+  Q_UNUSED(QtConcurrent::run([=, this]() {
     DeployResult dr;
     QString unhandled;
     try {
@@ -1612,7 +1613,7 @@ void VehicleImportPage::on_export() {
       }
     }
 
-    QMetaObject::invokeMethod(qApp, [=]() {
+    QMetaObject::invokeMethod(qApp, [=, this]() {
       if (btn_ptr) btn_ptr->setEnabled(true);
       if (!log_ptr) return;
       if (!unhandled.isEmpty()) {
