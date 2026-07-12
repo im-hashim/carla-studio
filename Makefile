@@ -29,6 +29,10 @@ else
 _CARLA :=
 endif
 
+ifdef CARLA_INSTALL_DIR
+_CARLA += -DCARLA_INSTALL_DIR="$(CARLA_INSTALL_DIR)"
+endif
+
 $(BUILD)/CMakeCache.txt:
 	cmake -S src -B "$(BUILD)" -DCMAKE_BUILD_TYPE=Release $(_CARLA)
 

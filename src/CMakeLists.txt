@@ -11,7 +11,6 @@ else ()
   add_compile_options (
     -Wall -Wextra -Werror
     -Wno-unused-result -Wno-missing-field-initializers
-    -Wno-c++20-extensions
     -Wshadow -Wconversion -Wsign-conversion
     -Wdouble-promotion -Wundef -Wnull-dereference -Wformat=2
     -fstack-protector-all
@@ -30,10 +29,8 @@ else ()
       -Wl,-z,noexecstack
     )
   endif ()
-  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_compile_options (-fstack-clash-protection)
-  endif ()
-  if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i[3-9]86)$" AND NOT APPLE)
+  add_compile_options (-fstack-clash-protection)
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i[3-9]86)$")
     add_compile_options (-fcf-protection=full)
   endif ()
 endif ()
@@ -235,7 +232,6 @@ add_library (
   ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/vehicle_import_container.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/vehicle_preview_page.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/vehicle_preview_window.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/view_gizmo.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/mesh_preview_renderer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/carla_spawn.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/plugin_setup.cpp
@@ -264,6 +260,8 @@ target_link_libraries (
 if (CARLA_STUDIO_QT_VERSION EQUAL 6)
   find_package (Qt6 COMPONENTS 3DCore 3DRender 3DInput 3DExtras QUIET)
   if (TARGET Qt6::3DCore AND TARGET Qt6::3DRender AND TARGET Qt6::3DInput AND TARGET Qt6::3DExtras)
+    target_sources (carla-studio-vehicle-import PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/vehicle/import/view_gizmo.cpp)
     target_link_libraries (carla-studio-vehicle-import PUBLIC
       Qt6::3DCore Qt6::3DRender Qt6::3DInput Qt6::3DExtras)
     target_compile_definitions (carla-studio-vehicle-import PUBLIC CARLA_STUDIO_WITH_QT3D)
@@ -273,6 +271,92 @@ if (CARLA_STUDIO_QT_VERSION EQUAL 6)
   endif ()
 else ()
   carla_message ("Qt5 path: vehicle preview viewer not built (Qt5 3D not wired).")
+endif ()
+
+# ---------------------------------------------------------------------------
+# Standalone CARLA client integration.
+# When CARLA_DIR is set and the carla-client target was not already provided by
+# a parent CMakeLists (CARLA workspace root build), look for a pre-installed
+# Carla package at <CARLA_DIR>/install and wire it in as an INTERFACE target.
+# The install layout is created on the CARLA host with:
+#   cmake --install <CARLA_DIR>/Build/LibCarla --prefix <CARLA_DIR>/install
+# Then rsynced locally. Vendored static deps live under install/lib/vendored/.
+# ---------------------------------------------------------------------------
+if (DEFINED CARLA_DIR AND NOT TARGET carla-client)
+  # CARLA_INSTALL_DIR can override the default <CARLA_DIR>/install to point to
+  # an alternative install prefix (e.g., a GCC-built variant instead of clang).
+  if (DEFINED CARLA_INSTALL_DIR)
+    set (_carla_install "${CARLA_INSTALL_DIR}")
+  else ()
+    set (_carla_install "${CARLA_DIR}/install")
+  endif ()
+  find_package (Carla CONFIG QUIET PATHS "${_carla_install}" NO_DEFAULT_PATH)
+  if (TARGET Carla::carla-client)
+    # Wrap in a plain INTERFACE target so we can attach extra link deps.
+    add_library (carla-client INTERFACE)
+    target_link_libraries (carla-client INTERFACE Carla::carla-client)
+
+    # Vendored static deps that libcarla-client.a was linked against.
+    set (_v "${_carla_install}/lib/vendored")
+    foreach (_dep
+      "${_v}/librpc.a"
+      "${_v}/libz.a"
+      "${_v}/libpng16.a"
+      "${_v}/boost/filesystem/libboost_filesystem.a"
+      "${_v}/boost/system/libboost_system.a"
+      "${_v}/boost/thread/libboost_thread.a"
+      "${_v}/boost/chrono/libboost_chrono.a"
+      "${_v}/boost/atomic/libboost_atomic.a"
+      "${_v}/boost/serialization/libboost_serialization.a"
+      "${_v}/boost/context/libboost_context.a"
+      "${_v}/boost/random/libboost_random.a"
+      "${_v}/boost/date_time/libboost_date_time.a"
+      "${_v}/boost/container/libboost_container.a"
+      "${_v}/boost/graph/libboost_graph.a"
+      "${_v}/recast/Detour/libDetour.a"
+      "${_v}/recast/DetourCrowd/libDetourCrowd.a"
+      "${_v}/recast/Recast/libRecast.a"
+    )
+      if (EXISTS "${_dep}")
+        target_link_libraries (carla-client INTERFACE "${_dep}")
+      endif ()
+    endforeach ()
+
+    # System deps pulled in by libcarla-client / boost::thread on Linux.
+    find_package (Threads REQUIRED)
+    target_link_libraries (carla-client INTERFACE Threads::Threads dl)
+
+    # Include dirs: carla headers (from install) + unified boost + rpclib.
+    # Boost headers may live either as a unified tree under install/include/boost
+    # (rsynced from remote) or in the original FetchContent source layout at
+    # Build/_deps/boost-src/libs/*/include.  Both are tried so the CMakeLists
+    # works identically for local and remote builds.
+    set (_boost_install_inc "${_carla_install}/include")
+    set (_boost_src_libs    "${CARLA_DIR}/Build/_deps/boost-src/libs")
+    set (_rpclib_src_inc    "${CARLA_DIR}/Build/_deps/rpclib-src/include")
+
+    set (_extra_incs "")
+    if (EXISTS "${_boost_install_inc}/boost")
+      list (APPEND _extra_incs "${_boost_install_inc}")
+    elseif (EXISTS "${_boost_src_libs}")
+      file (GLOB _boost_lib_incs LIST_DIRECTORIES true "${_boost_src_libs}/*/include")
+      list (APPEND _extra_incs ${_boost_lib_incs})
+    endif ()
+    if (EXISTS "${_rpclib_src_inc}")
+      list (APPEND _extra_incs "${_rpclib_src_inc}")
+    elseif (EXISTS "${_boost_install_inc}/rpc")
+      list (APPEND _extra_incs "${_boost_install_inc}")
+    endif ()
+
+    target_include_directories (carla-client INTERFACE
+      "${_carla_install}/include"
+      ${_extra_incs}
+    )
+
+    carla_message ("Carla standalone client wired in from ${_carla_install}")
+  else ()
+    carla_warning ("CARLA_DIR=${CARLA_DIR} set but no Carla package found at ${_carla_install}; carla-client unavailable.")
+  endif ()
 endif ()
 
 if (TARGET carla-client)
@@ -416,6 +500,22 @@ endif ()
 if (TARGET carla-client)
   target_link_libraries (carla-studio PUBLIC carla-client)
   target_compile_definitions (carla-studio PRIVATE CARLA_STUDIO_WITH_LIBCARLA)
+  # LibCarla headers use C-style float I/O and arithmetic patterns that trigger
+  # strict warnings in our build.  Suppress only the categories that originate
+  # from CARLA API usage so we don't mask unrelated bugs.
+  foreach (_t carla-studio carla-studio-vehicle-import)
+    if (TARGET ${_t})
+      target_compile_options (${_t} PRIVATE
+        -Wno-double-promotion
+        -Wno-conversion
+        -Wno-float-conversion
+        -Wno-sign-conversion
+        -Wno-shadow
+        -Wno-undef
+        -Wno-class-memaccess
+      )
+    endif ()
+  endforeach ()
 else ()
   carla_warning ("carla-client target is unavailable; configure from the CARLA workspace root with BUILD_CARLA_CLIENT=ON and BUILD_CARLA_STUDIO=ON for full LibCarla integration.")
 endif ()
