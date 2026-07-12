@@ -26,7 +26,7 @@ QByteArray scramble(const QByteArray &in) {
   QByteArray out;
   out.reserve(in.size());
   for (qsizetype i = 0; i < in.size(); ++i) {
-    out.append(static_cast<char>(static_cast<quint8>(in[i]) ^
+    out.append(static_cast<char>(static_cast<quint8>(in[static_cast<int>(i)]) ^
                                   kXorNonce[static_cast<size_t>(i) % sizeof(kXorNonce)]));
   }
   return out;
@@ -103,9 +103,11 @@ QProcess *verify_async(QObject *parent,
       }
 
       const qsizetype lastNewline = out.lastIndexOf('\n');
-      QByteArray body_bytes = lastNewline >= 0 ? out.left(lastNewline) : QByteArray();
+        QByteArray body_bytes = lastNewline >= 0
+          ? out.left(static_cast<int>(lastNewline))
+          : QByteArray();
       const QString statusStr = lastNewline >= 0
-          ? QString::fromLatin1(out.mid(lastNewline + 1)).trimmed()
+          ? QString::fromLatin1(out.mid(static_cast<int>(lastNewline + 1))).trimmed()
           : QString();
       info.http_status = statusStr.toInt();
 

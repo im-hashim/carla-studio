@@ -65,9 +65,9 @@ inline QString cpu_model_string() {
   for (const QByteArray &line : all.split('\n')) {
     const qsizetype colon = line.indexOf(':');
     if (colon < 0) continue;
-    const QByteArray key = line.left(colon).trimmed();
+    const QByteArray key = line.left(static_cast<int>(colon)).trimmed();
     if (key == "model name")
-      return QString::fromLocal8Bit(line.mid(colon + 1).trimmed());
+      return QString::fromLocal8Bit(line.mid(static_cast<int>(colon + 1)).trimmed());
   }
   return {};
 #endif
@@ -99,7 +99,7 @@ inline double cpu_clock_ghz() {
       const qsizetype colon = line.indexOf(':');
       if (colon < 0) continue;
       bool ok = false;
-      const double mhz = QByteArray(line.mid(colon + 1)).trimmed().toDouble(&ok);
+      const double mhz = QByteArray(line.mid(static_cast<int>(colon + 1))).trimmed().toDouble(&ok);
       if (ok && mhz > 0.0) return mhz / 1000.0;
     }
   }
@@ -117,34 +117,6 @@ inline bool pid_is_alive(qint64 pid) {
 #else
   Q_UNUSED(pid);
   return true;
-#endif
-}
-
-inline qint64 proc_cpu_jiffies(qint64 pid) {
-#if defined(Q_OS_LINUX) || defined(__linux__)
-  QFile f(QStringLiteral("/proc/%1/stat").arg(pid));
-  if (!f.open(QIODevice::ReadOnly)) return -1;
-  const QByteArray data = f.readAll();
-  const qsizetype rp = data.lastIndexOf(')');
-  if (rp < 0) return -1;
-  const QList<QByteArray> fields = data.mid(rp + 2).simplified().split(' ');
-  if (fields.size() < 13) return -1;
-  bool ok1 = false, ok2 = false;
-  const qint64 utime = fields[11].toLongLong(&ok1);
-  const qint64 stime = fields[12].toLongLong(&ok2);
-  return (ok1 && ok2) ? utime + stime : -1;
-#else
-  Q_UNUSED(pid);
-  return -1;
-#endif
-}
-
-inline int proc_clk_tck() {
-#if defined(Q_OS_LINUX) || defined(__linux__)
-  const long tck = sysconf(_SC_CLK_TCK);
-  return (tck > 0) ? static_cast<int>(tck) : 100;
-#else
-  return 100;
 #endif
 }
 

@@ -64,7 +64,7 @@ void detect_cpu(QString *model, int *logical, int *physical) {
     if (line.startsWith("processor")) (*logical)++;
     if (model->isEmpty() && line.startsWith("model name")) {
       const qsizetype colon = line.indexOf(':');
-      if (colon > 0) *model = line.mid(colon + 1).trimmed();
+      if (colon > 0) *model = line.mid(static_cast<int>(colon + 1)).trimmed();
     }
   }
   for (const QString &line : lines) {
@@ -72,7 +72,7 @@ void detect_cpu(QString *model, int *logical, int *physical) {
       const qsizetype colon = line.indexOf(':');
       if (colon > 0) {
         bool ok = false;
-        const int n = line.mid(colon + 1).trimmed().toInt(&ok);
+        const int n = line.mid(static_cast<int>(colon + 1)).trimmed().toInt(&ok);
         if (ok) { *physical = n; break; }
       }
     }
@@ -140,7 +140,7 @@ std::vector<GpuInfo> detectGpus(QString *driverOut, QString *cudaOut) {
         const qsizetype colon = line.indexOf(':', line.indexOf(':') + 1);
         if (colon > 0) {
           GpuInfo g;
-          g.name = line.mid(colon + 1).trimmed();
+          g.name = line.mid(static_cast<int>(colon + 1)).trimmed();
           out.push_back(g);
         }
       }

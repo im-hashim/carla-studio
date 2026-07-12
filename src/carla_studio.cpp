@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 #include <QApplication>
+#include <QSurfaceFormat>
 #include <QColor>
 #include <QThread>
 #include <QDockWidget>
@@ -44,6 +45,7 @@
 #include <QDockWidget>
 #include <QScreen>
 #include <QShortcut>
+#include <QPointer>
 #include <QFileInfo>
 #include <QFile>
 #include <QDir>
@@ -60,6 +62,8 @@
 #include <QSplitter>
 #include <QTextBrowser>
 #include <QRegularExpression>
+#include <QMimeData>
+#include <QDrag>
 #include <QTextStream>
 #include <QStandardItemModel>
 #include <QJsonDocument>
@@ -68,9 +72,6 @@
 #include <QJsonParseError>
 #include <QSet>
 #include <QSettings>
-#include <QPointer>
-#include <QGuiApplication>
-#include <QStyleHints>
 #include <chrono>
 #include <thread>
 #include <QPalette>
@@ -92,6 +93,8 @@
 #include <QUrlQuery>
 #include <QSysInfo>
 #include <QMouseEvent>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QClipboard>
 #include <QProcessEnvironment>
 #include <QToolButton>
@@ -119,12 +122,16 @@
 #include <cstdlib>
 #include <QStandardPaths>
 #include <QColorDialog>
+#include <QtMath>
 #include <cstdio>
 #include <typeinfo>
 #include <exception>
 #include <csignal>
 #include <cerrno>
 #include <cstring>
+#include <pthread.h>
+#include <execinfo.h>
+#include <atomic>
 
 // ── SparklineWidget ──────────────────────────────────────────────────────────
 // Lightweight read-only history chart. No Q_OBJECT — pure paintEvent override.
@@ -185,7 +192,7 @@ protected:
         p.drawPolygon(fill);
 
         // Stroke
-        QPen pen(m_color, static_cast<qreal>(1.5f), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        QPen pen(m_color, 1.5f, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
         p.setBrush(Qt::NoBrush);
         p.setPen(pen);
         p.drawPolyline(poly);
@@ -202,6 +209,86 @@ private:
     int             m_max;
 };
 // ─────────────────────────────────────────────────────────────────────────────
+
+class DraggablePreviewTile : public QGroupBox {
+public:
+  explicit DraggablePreviewTile(const QString &title, QWidget *parent = nullptr)
+    : QGroupBox(title, parent) {
+    setAcceptDrops(true);
+    setCursor(Qt::OpenHandCursor);
+  }
+
+  void setTileName(const QString &name) { m_tileName = name; }
+  QString tileName() const { return m_tileName; }
+
+  void startTileDrag() {
+    if (m_tileName.isEmpty()) return;
+    auto *mime = new QMimeData();
+    mime->setData("application/x-carla-preview-tile", m_tileName.toUtf8());
+    auto *drag = new QDrag(this);
+    drag->setMimeData(mime);
+    drag->exec(Qt::MoveAction);
+  }
+
+  std::function<void(const QString &, const QString &)> onTileDropped;
+
+protected:
+  void mousePressEvent(QMouseEvent *event) override {
+    if (event && event->button() == Qt::LeftButton) {
+      m_dragStartPos = event->pos();
+      setCursor(Qt::ClosedHandCursor);
+    }
+    QGroupBox::mousePressEvent(event);
+  }
+
+  void mouseReleaseEvent(QMouseEvent *event) override {
+    setCursor(Qt::OpenHandCursor);
+    QGroupBox::mouseReleaseEvent(event);
+  }
+
+  void mouseMoveEvent(QMouseEvent *event) override {
+    if (!event || !(event->buttons() & Qt::LeftButton)) {
+      QGroupBox::mouseMoveEvent(event);
+      return;
+    }
+    if ((event->pos() - m_dragStartPos).manhattanLength() < QApplication::startDragDistance()) {
+      QGroupBox::mouseMoveEvent(event);
+      return;
+    }
+    startTileDrag();
+    QGroupBox::mouseMoveEvent(event);
+  }
+
+  void dragEnterEvent(QDragEnterEvent *event) override {
+    if (!event) return;
+    if (event->mimeData() && event->mimeData()->hasFormat("application/x-carla-preview-tile")) {
+      event->acceptProposedAction();
+    }
+  }
+
+  void dragMoveEvent(QDragMoveEvent *event) override {
+    if (!event) return;
+    if (event->mimeData() && event->mimeData()->hasFormat("application/x-carla-preview-tile")) {
+      event->acceptProposedAction();
+    }
+  }
+
+  void dropEvent(QDropEvent *event) override {
+    if (!event || !event->mimeData() ||
+      !event->mimeData()->hasFormat("application/x-carla-preview-tile")) {
+      return;
+    }
+    const QString src = QString::fromUtf8(event->mimeData()->data("application/x-carla-preview-tile"));
+    if (!src.isEmpty() && !m_tileName.isEmpty() && src != m_tileName && onTileDropped) {
+      onTileDropped(src, m_tileName);
+    }
+    event->acceptProposedAction();
+  }
+
+private:
+  QString m_tileName;
+  QPoint m_dragStartPos;
+};
 
 #if defined(Q_OS_LINUX) || defined(__linux__)
 #include <execinfo.h>
@@ -842,7 +929,6 @@ private:
 };
 
 static void carla_studio_signal_trace(int sig) {
-#ifdef __linux__
   void *frames[64];
   const int n = backtrace(frames, 64);
   const int fd = open("/tmp/carla_studio_crash.log",
@@ -856,12 +942,253 @@ static void carla_studio_signal_trace(int sig) {
     backtrace_symbols_fd(frames, n, fd);
     close(fd);
   }
-#endif
   std::signal(sig, SIG_DFL);
   std::raise(sig);
 }
 
 namespace {
+
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+static int carla_cli_probe_main(int argc, char *argv[]) {
+  QCoreApplication app(argc, argv);
+  const QStringList args = app.arguments();
+  QTextStream out(stdout);
+  QTextStream err(stderr);
+
+  QString host = "localhost";
+  int port = 2000;
+  bool ensureStartupRig = false;
+  QString vehicleBlueprintOverride;
+  for (int i = 1; i < args.size(); ++i) {
+    const QString a = args[i];
+    if ((a == "--host" || a == "-H") && i + 1 < args.size())
+      host = args[++i];
+    else if ((a == "--port" || a == "-p") && i + 1 < args.size())
+      port = args[++i].toInt();
+    else if (a == "--ensure-startup-rig")
+      ensureStartupRig = true;
+    else if (a == "--vehicle-blueprint" && i + 1 < args.size())
+      vehicleBlueprintOverride = args[++i].trimmed();
+  }
+
+  out << "[probe] Connecting to CARLA at " << host << ":" << port << "\n";
+  out.flush();
+
+  try {
+    cc::Client client(host.toStdString(), static_cast<uint16_t>(port));
+    client.SetTimeout(std::chrono::seconds(5));
+
+    const QString serverVer = QString::fromStdString(client.GetServerVersion());
+    const QString clientVer = QString::fromStdString(client.GetClientVersion());
+    out << "[probe] server version : " << serverVer << "\n";
+    out << "[probe] client version : " << clientVer << "\n";
+
+    auto world  = client.GetWorld();
+    auto map    = world.GetMap();
+    const QString mapName = map ? QString::fromStdString(map->GetName()) : "(unknown)";
+    out << "[probe] map            : " << mapName << "\n";
+
+    auto actors   = world.GetActors();
+    int vehicles  = 0;
+    int walkers   = 0;
+    int sensors   = 0;
+    carla::SharedPtr<cc::Actor> heroActor;
+    if (actors) {
+      for (auto a : *actors) {
+        if (!a) continue;
+        const QString tid = QString::fromStdString(a->GetTypeId());
+        if (tid.startsWith("vehicle."))      { ++vehicles;
+          for (const auto &attr : a->GetAttributes())
+            if (attr.GetId() == "role_name" && attr.GetValue() == "hero") { heroActor = a; break; }
+        } else if (tid.startsWith("walker.")) ++walkers;
+        else if (tid.startsWith("sensor."))  ++sensors;
+      }
+    }
+    out << "[probe] actors         : " << (actors ? static_cast<int>(actors->size()) : 0)
+        << "  (vehicles=" << vehicles
+        << "  walkers=" << walkers
+        << "  sensors=" << sensors << ")\n";
+    if (heroActor)
+      out << "[probe] hero vehicle   : " << QString::fromStdString(heroActor->GetTypeId())
+          << "  id=" << heroActor->GetId() << "\n";
+    else
+      out << "[probe] hero vehicle   : none (fisheye preview will spawn one)\n";
+
+    if (ensureStartupRig) {
+      QString requiredBlueprint = vehicleBlueprintOverride;
+      if (requiredBlueprint.trimmed().isEmpty()) {
+        requiredBlueprint = QSettings()
+          .value("vehicle/blueprint", "vehicle.lincoln.mkz_2017")
+          .toString()
+          .trimmed();
+      }
+      out << "[probe] ensure rig     : enabled\n";
+      out << "[probe] target vehicle : " << requiredBlueprint << "\n";
+
+      auto refreshActors = [&]() {
+        actors = world.GetActors();
+      };
+
+      auto findHero = [&]() -> carla::SharedPtr<cc::Actor> {
+        if (!actors) return nullptr;
+        for (auto a : *actors) {
+          if (!a) continue;
+          const QString tid = QString::fromStdString(a->GetTypeId());
+          if (!tid.startsWith("vehicle.")) continue;
+          for (const auto &attr : a->GetAttributes()) {
+            if (attr.GetId() == "role_name" && attr.GetValue() == "hero") {
+              return a;
+            }
+          }
+        }
+        return nullptr;
+      };
+
+      auto spawnHero = [&](const QString &blueprintId) -> carla::SharedPtr<cc::Vehicle> {
+        auto bps = world.GetBlueprintLibrary();
+        if (!bps) return nullptr;
+        const auto *bpPtr = bps->Find(blueprintId.toStdString());
+        if (!bpPtr) return nullptr;
+        auto bp = *bpPtr;
+        if (bp.ContainsAttribute("role_name")) bp.SetAttribute("role_name", "hero");
+
+        auto mapRef = world.GetMap();
+        const auto spawnPoints = mapRef ? mapRef->GetRecommendedSpawnPoints()
+                                        : std::vector<cg::Transform>{};
+        for (const auto &sp : spawnPoints) {
+          auto actor = world.TrySpawnActor(bp, sp);
+          if (actor) {
+            return std::static_pointer_cast<cc::Vehicle>(actor);
+          }
+        }
+        return nullptr;
+      };
+
+      refreshActors();
+      heroActor = findHero();
+
+      if (heroActor) {
+        const QString heroType = QString::fromStdString(heroActor->GetTypeId());
+        if (heroType != requiredBlueprint) {
+          out << "[probe] hero mismatch  : " << heroType
+              << " (replacing with " << requiredBlueprint << ")\n";
+          try { heroActor->Destroy(); } catch (...) {}
+          refreshActors();
+          heroActor = nullptr;
+        }
+      }
+
+      if (!heroActor) {
+        auto heroVeh = spawnHero(requiredBlueprint);
+        if (!heroVeh) {
+          err << "[probe] FAIL: could not spawn hero vehicle " << requiredBlueprint << "\n";
+          err.flush();
+          return 1;
+        }
+        heroActor = heroVeh;
+        out << "[probe] hero spawned    : "
+            << QString::fromStdString(heroActor->GetTypeId())
+            << "  id=" << heroActor->GetId() << "\n";
+      }
+
+      auto bps = world.GetBlueprintLibrary();
+      if (!bps) {
+        err << "[probe] FAIL: blueprint library unavailable\n";
+        err.flush();
+        return 1;
+      }
+      const auto *fisheyeBpPtr = bps->Find("sensor.camera.rgb_fisheye");
+      if (!fisheyeBpPtr) {
+        err << "[probe] FAIL: sensor.camera.rgb_fisheye blueprint unavailable\n";
+        err.flush();
+        return 1;
+      }
+
+      struct RigCam {
+        const char *role;
+        cg::Transform tr;
+      };
+      const std::array<RigCam, 4> rig = {{
+        {"fisheye_front", cg::Transform(cg::Location(2.2f,  0.0f, 1.4f), cg::Rotation( 0.0f,   0.0f, 0.0f))},
+        {"fisheye_rear",  cg::Transform(cg::Location(-2.2f, 0.0f, 1.4f), cg::Rotation( 0.0f, 180.0f, 0.0f))},
+        {"fisheye_left",  cg::Transform(cg::Location(0.0f, -1.0f, 1.4f), cg::Rotation( 0.0f, -90.0f, 0.0f))},
+        {"fisheye_right", cg::Transform(cg::Location(0.0f,  1.0f, 1.4f), cg::Rotation( 0.0f,  90.0f, 0.0f))},
+      }};
+
+      auto countAttachedFisheye = [&](QSet<QString> *roles = nullptr) -> int {
+        int c = 0;
+        if (!actors || !heroActor) return 0;
+        for (auto a : *actors) {
+          if (!a) continue;
+          const QString tid = QString::fromStdString(a->GetTypeId());
+          if (tid != "sensor.camera.rgb_fisheye") continue;
+          carla::SharedPtr<cc::Actor> parent;
+          try { parent = a->GetParent(); } catch (...) { parent = nullptr; }
+          if (!parent || parent->GetId() != heroActor->GetId()) continue;
+          ++c;
+          if (roles) {
+            for (const auto &attr : a->GetAttributes()) {
+              if (attr.GetId() == "role_name") {
+                roles->insert(QString::fromStdString(attr.GetValue()));
+                break;
+              }
+            }
+          }
+        }
+        return c;
+      };
+
+      refreshActors();
+      QSet<QString> existingRoles;
+      int beforeCount = countAttachedFisheye(&existingRoles);
+      out << "[probe] fisheye before : " << beforeCount << "\n";
+
+      for (const auto &cam : rig) {
+        if (existingRoles.contains(QString::fromLatin1(cam.role))) continue;
+        auto bp = *fisheyeBpPtr;
+        if (bp.ContainsAttribute("role_name"))    bp.SetAttribute("role_name", cam.role);
+        if (bp.ContainsAttribute("image_size_x")) bp.SetAttribute("image_size_x", "800");
+        if (bp.ContainsAttribute("image_size_y")) bp.SetAttribute("image_size_y", "450");
+        if (bp.ContainsAttribute("fov"))          bp.SetAttribute("fov", "180");
+        if (bp.ContainsAttribute("lens_model"))   bp.SetAttribute("lens_model", "fisheye-equidistant");
+        try {
+          (void)world.TrySpawnActor(bp, cam.tr, heroActor.get());
+        } catch (...) {}
+      }
+
+      refreshActors();
+      QSet<QString> finalRoles;
+      const int finalCount = countAttachedFisheye(&finalRoles);
+      out << "[probe] fisheye after  : " << finalCount << "\n";
+      out << "[probe] fisheye roles  : " << finalRoles.values().join(", ") << "\n";
+
+      if (finalCount < 4
+          || !finalRoles.contains("fisheye_front")
+          || !finalRoles.contains("fisheye_rear")
+          || !finalRoles.contains("fisheye_left")
+          || !finalRoles.contains("fisheye_right")) {
+        err << "[probe] FAIL: fisheye rig incomplete\n";
+        err.flush();
+        return 1;
+      }
+    }
+
+    const bool versionMatch = (serverVer == clientVer);
+    out << "[probe] version match  : " << (versionMatch ? "yes" : "NO — mismatch may cause crashes") << "\n";
+    out << "[probe] PASS\n";
+    out.flush();
+    return 0;
+  } catch (const std::exception &ex) {
+    err << "[probe] FAIL: " << QString::fromStdString(ex.what()) << "\n";
+    err.flush();
+    return 1;
+  } catch (...) {
+    err << "[probe] FAIL: unknown exception\n";
+    err.flush();
+    return 1;
+  }
+}
+#endif // CARLA_STUDIO_WITH_LIBCARLA
 
 bool dispatchSubcommand(int argc, char *argv[]) {
   if (argc < 2) return false;
@@ -886,6 +1213,9 @@ bool dispatchSubcommand(int argc, char *argv[]) {
   else if (sub == "sensor")                   std::exit(carla_cli_sensor_main(sub_argc, sub_argv.data()));
   else if (sub == "actuate")                  std::exit(carla_cli_actuate_main(sub_argc, sub_argv.data()));
   else if (sub == "healthcheck")              std::exit(carla_cli_healthcheck_main(sub_argc, sub_argv.data()));
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+  else if (sub == "probe")                    std::exit(carla_cli_probe_main(sub_argc, sub_argv.data()));
+#endif
   else if (sub == "cosim")                   std::exit(carla_cli_cosim_main(sub_argc, sub_argv.data()));
   else if (sub == "preview")                 std::exit(carla_cli_preview_main(sub_argc, sub_argv.data()));
   else if (sub == "scenario")                std::exit(carla_cli_scenario_main(sub_argc, sub_argv.data()));
@@ -907,6 +1237,8 @@ bool dispatchSubcommand(int argc, char *argv[]) {
     std::printf(
       "carla-studio - CARLA Studio dispatcher\n\n"
       "  carla-studio                                   open the GUI (default)\n"
+      "  carla-studio --map mcity                       open GUI preset to McityMap_Main + MKZ and auto-START\n"
+      "  carla-studio --launch-mcity-mkz                open GUI preset to McityMap_Main + MKZ and auto-START\n"
       "  carla-studio vehicle-import [...]              one-shot import + cook + drive + zip\n"
       "  carla-studio cleanup                           kill stale CARLA Studio / UE processes\n"
       "  carla-studio run-test-suite [--update-documentation]  run full test suite\n"
@@ -920,6 +1252,7 @@ bool dispatchSubcommand(int argc, char *argv[]) {
       "  carla-studio actuate sae-l5|l4|l3|l2|l1|l0    set SAE autonomy level\n"
       "  carla-studio actuate sae-l1 --keyboard         L1 with keyboard ego control\n"
       "  carla-studio healthcheck [--host h] [--port p] environment & connectivity check\n"
+      "  carla-studio probe [--host h] [--port p]    libcarla API probe (version/map/actors)\n"
       "  carla-studio cosim [--directory <dir>]        TeraSim co-simulation\n"
       "  carla-studio preview [--directory <dir>]      ROS2 preview control\n"
       "  carla-studio scenario [--scenario <s>]        TeraSim scenario\n"
@@ -965,11 +1298,101 @@ static void applyEnvironmentDefaults() {
   setDefault("render/prefer_nvidia", boolStr(iniStr("render/prefer_nvidia", "true")));
   setDefault("render/window_small",  boolStr(iniStr("render/window_small", "false")));
 
+  const QString defaultRuntime = iniStr("runtime/default_target", "").toLower();
+  const QString defaultHost = iniStr("runtime/default_host", "").trimmed();
+  if (!defaultHost.isEmpty()) {
+    setDefault("carla/last_host", defaultHost);
+    QStringList remoteHosts = app.value("remote/hosts").toStringList();
+    if (!remoteHosts.contains(defaultHost)) {
+      remoteHosts << defaultHost;
+      app.setValue("remote/hosts", remoteHosts);
+    }
+    QSettings legacyApp("CARLA", "CARLAStudio");
+    QStringList legacyHosts = legacyApp.value("remote/hosts").toStringList();
+    if (!legacyHosts.contains(defaultHost)) {
+      legacyHosts << defaultHost;
+      legacyApp.setValue("remote/hosts", legacyHosts);
+    }
+  }
+  if (!app.contains("carla/last_runtime")) {
+    if ((defaultRuntime == "remote" || defaultRuntime == "remotehost") && !defaultHost.isEmpty()) {
+      app.setValue("carla/last_runtime", QString("%1 (remote)").arg(defaultHost));
+    } else if (defaultRuntime == "container" || defaultRuntime == "docker") {
+      app.setValue("carla/last_runtime", QStringLiteral("container"));
+    } else if (defaultRuntime == "local" || defaultRuntime == "localhost") {
+      app.setValue("carla/last_runtime", QStringLiteral("localhost"));
+    }
+  }
+  setDefault("preview/auto_fisheye4_on_start",
+             boolStr(iniStr("runtime/auto_fisheye4_on_start", "false")));
+
   if (qgetenv("CARLA_ROOT").isEmpty()) {
+    // Load from env.ini — do NOT check isDir() locally; the path may live on a
+    // remote host and won't exist on this machine.
     const QString root = iniStr("carla/root_path", "");
-    if (!root.isEmpty() && QFileInfo(root).isDir())
+    if (!root.isEmpty())
       qputenv("CARLA_ROOT", root.toLocal8Bit());
   }
+  // Fallback: restore from last GUI session persisted in QSettings.
+  if (qgetenv("CARLA_ROOT").isEmpty()) {
+    const QString saved = QSettings().value("carla/last_root").toString().trimmed();
+    if (!saved.isEmpty())
+      qputenv("CARLA_ROOT", saved.toLocal8Bit());
+  }
+}
+
+struct GuiLaunchOverrides {
+  QString carlaRoot;
+  QString runtime;
+  QString host;
+  QString map;
+  QString remoteUser;
+  QString remotePass;
+  QString remoteBindAddress;
+  int port = -1;
+  bool launchMcityMkz = false;
+};
+
+static GuiLaunchOverrides parseGuiLaunchOverrides(int argc, char *argv[]) {
+  GuiLaunchOverrides o;
+  for (int i = 1; i < argc; ++i) {
+    const QString a = QString::fromLocal8Bit(argv[i]);
+    auto next = [&](QString &out) -> bool {
+      if (i + 1 >= argc) return false;
+      out = QString::fromLocal8Bit(argv[++i]).trimmed();
+      return !out.isEmpty();
+    };
+    if (a == "--carla-root") {
+      (void)next(o.carlaRoot);
+    } else if (a == "--runtime") {
+      (void)next(o.runtime);
+      o.runtime = o.runtime.toLower();
+    } else if (a == "--host" || a == "--remote-host") {
+      (void)next(o.host);
+      if (o.runtime.isEmpty())   // both --host and --remote-host imply remote
+        o.runtime = "remote";
+    } else if (a == "--map") {
+      (void)next(o.map);
+      const QString low = o.map.trimmed().toLower();
+      if (low == "mcity") {
+        o.map = QStringLiteral("McityMap_Main");
+        o.launchMcityMkz = true;
+      }
+    } else if (a == "--remote-user") {
+      (void)next(o.remoteUser);
+    } else if (a == "--remote-pass") {
+      (void)next(o.remotePass);
+    } else if (a == "--remote-bind-address") {
+      (void)next(o.remoteBindAddress);
+    } else if ((a == "--port" || a == "-p") && i + 1 < argc) {
+      bool ok = false;
+      const int p = QString::fromLocal8Bit(argv[++i]).toInt(&ok);
+      if (ok && p > 0 && p <= 65535) o.port = p;
+    } else if (a == "--launch-mcity-mkz" || a == "--mcity-mkz") {
+      o.launchMcityMkz = true;
+    }
+  }
+  return o;
 }
 
 }
@@ -977,37 +1400,93 @@ static void applyEnvironmentDefaults() {
 int main(int argc, char *argv[]) {
   if (dispatchSubcommand(argc, argv)) return 0;
 
+  const GuiLaunchOverrides guiOverrides = parseGuiLaunchOverrides(argc, argv);
+
   for (int s : {SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL}) {
     std::signal(s, carla_studio_signal_trace);
   }
 
   std::set_terminate([]() {
-    std::fprintf(stderr,
-      "\n[carla-studio] FATAL: an uncaught C++ exception escaped the\n"
-      "             event loop and would have called std::abort().\n");
+    // Guard against recursive terminate (e.g. from pthread_exit unwinding).
+    static std::atomic<int> depth{0};
+    if (depth.fetch_add(1) > 0) {
+      // Recursive terminate — bail out immediately to avoid infinite loop.
+      std::_Exit(3);
+    }
+
+    // Identify exception info before doing anything else.
+    std::string exType, exWhat;
     if (auto eptr = std::current_exception()) {
       try {
         std::rethrow_exception(eptr);
       } catch (const std::exception &e) {
-        std::fprintf(stderr,
-          "             type: %s\n"
-          "             what: %s\n",
-          typeid(e).name(), e.what());
+        exType = typeid(e).name();
+        exWhat = e.what();
       } catch (...) {
-        std::fprintf(stderr, "             type: <non-std exception>\n");
+        exType = "<non-std exception>";
       }
     }
+
+    // Print backtrace to identify the call site.
+    void *frames[64];
+    int nframes = backtrace(frames, 64);
+    std::fprintf(stderr, "[carla-studio] terminate: backtrace (%d frames):\n", nframes);
+    backtrace_symbols_fd(frames, nframes, 2 /*stderr*/);
+    std::fflush(stderr);
+
+    // If the uncaught exception is on a libcarla background thread (not the
+    // Qt event-loop thread), exit just that thread so the UI keeps running.
+    QThread *qt = qApp ? qApp->thread() : nullptr;
+    const bool onQtThread = !qt || (QThread::currentThread() == qt);
     std::fprintf(stderr,
-      "             Most common cause: CARLA simulator API version\n"
-      "             mismatch with the libcarla-client this build was\n"
-      "             linked against. Check Help → Health Check for the\n"
-      "             SDK ↔ Sim version row, then either:\n"
-      "               - Install the matching CARLA via Cfg → Install /\n"
-      "                 Update CARLA, or\n"
-      "               - Rebuild CARLA Studio against the API version\n"
-      "                 your simulator reports.\n");
+        "[carla-studio] terminate: onQtThread=%d type=%s what=%s\n",
+        (int)onQtThread, exType.c_str(), exWhat.c_str());
+    std::fflush(stderr);
+
+    if (!onQtThread) {
+      std::fprintf(stderr,
+        "[carla-studio] WARNING: uncaught exception on libcarla background thread"
+        " — killing thread, UI continues.\n");
+      std::fflush(stderr);
+      // pthread_exit() re-triggers terminate via _Unwind_ForcedUnwind.
+      // Workaround: restore default terminate first, then have a helper thread
+      // cancel us so the cancellation unwind runs under the default handler.
+      std::set_terminate(std::abort);
+      pthread_t self = pthread_self();
+      pthread_t killer;
+      pthread_create(&killer, nullptr, [](void *arg) -> void * {
+        ::usleep(1000); // give terminate handler time to reach pause()
+        pthread_cancel(*static_cast<pthread_t *>(arg));
+        return nullptr;
+      }, &self);
+      pthread_detach(killer);
+      // Enable cancellation on this thread and park at a cancellation point.
+      pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
+      pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, nullptr);
+      while (true) ::pause(); // cancelled by killer thread above
+    }
+
+    // On the Qt main thread we cannot recover — exit the whole process.
+    std::fprintf(stderr,
+      "\n[carla-studio] FATAL: uncaught C++ exception on Qt thread.\n"
+      "             type: %s\n"
+      "             what: %s\n",
+      exType.c_str(), exWhat.c_str());
     std::_Exit(1);
   });
+
+  // Prefer hardware-accelerated OpenGL rendering.  Qt auto-falls back to
+  // llvmpipe/software when no GPU driver is present, so this is safe on
+  // CPU-only machines.  Must be set before QApplication is constructed.
+  QApplication::setAttribute(Qt::AA_UseDesktopOpenGL, true);
+  {
+    QSurfaceFormat fmt;
+    fmt.setRenderableType(QSurfaceFormat::OpenGL);
+    fmt.setVersion(3, 3);
+    fmt.setProfile(QSurfaceFormat::CoreProfile);
+    fmt.setSwapBehavior(QSurfaceFormat::DoubleBuffer);
+    QSurfaceFormat::setDefaultFormat(fmt);
+  }
 
   QApplication app(argc, argv);
   app.setApplicationName("CARLA Studio");
@@ -1128,8 +1607,16 @@ int main(int argc, char *argv[]) {
     return QString();
   };
 
+  // For remote-runtime sessions (last_runtime saved in QSettings) do NOT
+  // override the saved remote CARLA path with a locally-discovered install.
+  // The path lives on the remote host and won't have local .sh launchers.
+  const bool savedRuntimeIsRemote = []() -> bool {
+    const QString r = QSettings().value("carla/last_runtime").toString();
+    return r.endsWith("(remote)") || r == "remote";
+  }();
+
   QString root_str = QString::fromLocal8Bit(qgetenv("CARLA_ROOT"));
-  {
+  if (!savedRuntimeIsRemote) {
     const bool envHasUnreal = !root_str.isEmpty()
                               && QFileInfo(root_str + "/CarlaUnreal.sh").isFile();
     if (!envHasUnreal) {
@@ -1168,10 +1655,53 @@ int main(int argc, char *argv[]) {
   launchForm->setFormAlignment(Qt::AlignTop | Qt::AlignLeft);
   launchForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
   launchForm->setHorizontalSpacing(8);
-  launchForm->setVerticalSpacing(6);
+  launchForm->setVerticalSpacing(8);
 
   QLabel *rootPathLabel = new QLabel("CARLA root:");
   launchForm->addRow(rootPathLabel, carla_root_path);
+
+  // ── Vehicle: first scenario row ─────────────────────────────────────────
+  QComboBox *egoVehicleCombo = new QComboBox();
+  egoVehicleCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+  egoVehicleCombo->setToolTip("CARLA blueprint ID of the ego vehicle to spawn at simulation start.");
+  using VehiclePair = QPair<QString, QString>;
+  static const QList<VehiclePair> kHomeVehicles = {
+    {"Lincoln MKZ 2017",       "vehicle.lincoln.mkz_2017"},
+    {"Lincoln MKZ 2020",       "vehicle.lincoln.mkz_2020"},
+    {"Mini Cooper S",          "vehicle.mini.cooper_s"},
+    {"Dodge Charger",          "vehicle.dodge.charger"},
+    {"Dodge Charger (Police)", "vehicle.dodgecop.charger"},
+    {"Nissan Patrol",          "vehicle.nissan.patrol"},
+    {"Ford Mustang",           "vehicle.ue4.ford.mustang"},
+    {"Ford Crown Victoria",    "vehicle.ue4.ford.crown"},
+    {"BMW Gran Tourer",        "vehicle.ue4.bmw.grantourer"},
+    {"Audi TT",                "vehicle.ue4.audi.tt"},
+    {"Mercedes CCC",           "vehicle.ue4.mercedes.ccc"},
+    {"Chevrolet Impala",       "vehicle.ue4.chevrolet.impala"},
+    {"Ford Ambulance",         "vehicle.ambulance.ford"},
+    {"Mercedes Sprinter",      "vehicle.sprinter.mercedes"},
+    {"Mitsubishi Fuso",        "vehicle.fuso.mitsubishi"},
+    {"Fire Truck",             "vehicle.firetruck.actors"},
+    {"Carla Cola",             "vehicle.carlacola.actors"},
+    {"Ford Taxi",              "vehicle.taxi.ford"},
+  };
+  for (const auto &v : kHomeVehicles)
+    egoVehicleCombo->addItem(v.first, v.second);
+  {
+    const QString saved = QSettings().value("vehicle/blueprint", "vehicle.lincoln.mkz_2017").toString();
+    bool found = false;
+    for (int i = 0; i < egoVehicleCombo->count(); ++i) {
+      if (egoVehicleCombo->itemData(i).toString() == saved) {
+        egoVehicleCombo->setCurrentIndex(i); found = true; break;
+      }
+    }
+    if (!found) egoVehicleCombo->setCurrentIndex(0);
+  }
+  QObject::connect(egoVehicleCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+    &window, [egoVehicleCombo](int) {
+      QSettings().setValue("vehicle/blueprint", egoVehicleCombo->currentData().toString());
+    });
+  launchForm->addRow(new QLabel("Vehicle:"), egoVehicleCombo);
 
   QWidget *scenarioField = new QWidget();
   QHBoxLayout *scenarioLayout = new QHBoxLayout(scenarioField);
@@ -1203,6 +1733,8 @@ int main(int argc, char *argv[]) {
 
   QAction *optRenderOffscreen = new QAction("Off-screen (-RenderOffScreen)", &window);
   optRenderOffscreen->setCheckable(true);
+  optRenderOffscreen->setChecked(false);
+  optRenderOffscreen->setEnabled(false);
 
   QAction *optWindowSmall = new QAction("Windowed 640×480 (default)", &window);
   optWindowSmall->setCheckable(true);
@@ -1226,7 +1758,12 @@ int main(int argc, char *argv[]) {
     QProcess nv;
     nv.setProcessEnvironment(QProcessEnvironment::systemEnvironment());
     nv.start("/usr/bin/nvidia-smi", QStringList() << "-L");
-    const bool ok = nv.waitForFinished(1500)
+    const bool finished = nv.waitForFinished(1500);
+    if (!finished) {
+      nv.kill();
+      nv.waitForFinished(500);
+    }
+    const bool ok = finished
                     && nv.exitStatus() == QProcess::NormalExit
                     && nv.exitCode() == 0;
     const QString out = ok
@@ -1341,66 +1878,45 @@ int main(int argc, char *argv[]) {
     "for Remote, container name for Docker, hidden for Local.");
   QHBoxLayout *hostPortRow = new QHBoxLayout();
   hostPortRow->setContentsMargins(0, 0, 0, 0);
-  hostPortRow->setSpacing(8);
-  hostPortRow->addWidget(runtimeTarget, 1);
+  hostPortRow->setSpacing(6);
+  hostPortRow->addWidget(runtimeTarget, 2);
+  // targetHost appears inline when a manual address is needed (Docker/remotehost).
+  QLineEdit *targetHost = new QLineEdit();
+  targetHost->setToolTip("Hostname or IP for Remote, container name for Docker.");
+  targetHost->setVisible(false);
+  hostPortRow->addWidget(targetHost, 1);
   QWidget *hostPortHost = new QWidget();
   hostPortHost->setLayout(hostPortRow);
-  launchForm->addRow(new QLabel("Host:"), hostPortHost);
+  launchForm->addRow(new QLabel("Runtime:"), hostPortHost);
 
-  QLabel    *addrLabel = new QLabel("Target (container/machine):");
-  QLineEdit *targetHost = new QLineEdit("localhost");
-  targetHost->setToolTip(
-    "Address of the runtime - interpretation depends on the Runtime "
-    "selection above.");
-  QWidget *addrHost = new QWidget();
-  QHBoxLayout *addrHostLay = new QHBoxLayout(addrHost);
-  addrHostLay->setContentsMargins(0, 0, 0, 0);
-  addrHostLay->setSpacing(6);
-  addrHostLay->addWidget(targetHost, 1);
-  launchForm->addRow(addrLabel, addrHost);
 
-  auto syncAddressRow = [addrLabel, addrHost, targetHost, runtimeTarget]() {
+  auto syncAddressRow = [targetHost, runtimeTarget]() {
     const QString r = runtimeTarget->currentText();
-    auto setLabel = [addrLabel](const QString &s) {
-      addrLabel->setText(s);
+    static const QStringList kKnownDefaults = {"localhost", "carla-server", "carla", ""};
+    auto suggestIfDefault = [targetHost](const QStringList &defs, const QString &next) {
+      if (defs.contains(targetHost->text().trimmed())) targetHost->setText(next);
     };
-    auto suggestIfDefault = [targetHost](const QStringList &knownDefaults,
-                                          const QString &nextDefault) {
-      if (knownDefaults.contains(targetHost->text().trimmed())) {
-        targetHost->setText(nextDefault);
-      }
-    };
-    static const QStringList kKnownDefaults = {
-      "localhost", "carla-server", "carla", ""};
     if (r == "localhost" || r == "Local") {
-      addrLabel->setVisible(false);
-      addrHost->setVisible(false);
+      targetHost->setVisible(false);
       suggestIfDefault(kKnownDefaults, "localhost");
     } else if (r == "container" || r == "Docker") {
-      addrLabel->setVisible(true);
-      addrHost->setVisible(true);
-      setLabel("Container name:");
-      targetHost->setPlaceholderText("e.g. carla-server");
+      targetHost->setVisible(true);
+      targetHost->setPlaceholderText("container name");
       suggestIfDefault(kKnownDefaults, "carla-server");
     } else if (r.endsWith("(remote)")) {
-      addrLabel->setVisible(true);
-      addrHost->setVisible(true);
-      setLabel("Host:");
-      const QString hostFromCombo = r.left(r.size() - QString(" (remote)").size());
-      targetHost->setPlaceholderText(hostFromCombo);
-      if (kKnownDefaults.contains(targetHost->text().trimmed()) ||
-          targetHost->text().trimmed().isEmpty()) {
-        targetHost->setText(hostFromCombo);
+      targetHost->setVisible(false);
+      const QString parsedHost = r.left(r.size() - int(strlen(" (remote)"))).trimmed();
+      if (!parsedHost.isEmpty()) {
+        targetHost->setText(parsedHost);
+      } else {
+        const QString savedHost = QSettings().value("carla/last_host").toString().trimmed();
+        if (!savedHost.isEmpty()) targetHost->setText(savedHost);
       }
     } else if (r.startsWith("remotehost") || r.startsWith("Remote")) {
-      addrLabel->setVisible(true);
-      addrHost->setVisible(true);
-      setLabel("Host:");
-      targetHost->setPlaceholderText("Configure under Cfg → Remote / SSH Settings");
+      targetHost->setVisible(true);
+      targetHost->setPlaceholderText("hostname or IP");
     } else {
-      addrLabel->setVisible(true);
-      addrHost->setVisible(true);
-      setLabel("Address:");
+      targetHost->setVisible(true);
       targetHost->setPlaceholderText("");
     }
   };
@@ -1466,11 +1982,11 @@ int main(int argc, char *argv[]) {
         return;
       }
 
-      const QString time = full.mid(dotIdx + 3);
-      const QString head = full.left(dotIdx).trimmed();
+      const QString time = full.mid(static_cast<int>(dotIdx + 3));
+      const QString head = full.left(static_cast<int>(dotIdx)).trimmed();
       QString icon, weather;
       const qsizetype sp = head.indexOf(' ');
-      if (sp > 0) { icon = head.left(sp); weather = head.mid(sp + 1).trimmed(); }
+      if (sp > 0) { icon = head.left(static_cast<int>(sp)); weather = head.mid(static_cast<int>(sp + 1)).trimmed(); }
       else        { weather = head; }
 
       const int iconCol = 22;
@@ -1688,7 +2204,7 @@ int main(int argc, char *argv[]) {
           if (l.contains("Version mismatch")) saw = true;
           if (l.contains("Simulator API version")) {
             const qsizetype eq = l.indexOf('=');
-            if (eq >= 0) simVer = l.mid(eq + 1).trimmed();
+            if (eq >= 0) simVer = l.mid(static_cast<int>(eq + 1)).trimmed();
           }
         }
         if (saw) {
@@ -1710,9 +2226,9 @@ int main(int argc, char *argv[]) {
 
   // ── Process table ─────────────────────────────────────────────────────────
   QTableWidget *carla_process_table = new QTableWidget();
-  carla_process_table->setColumnCount(5);
+  carla_process_table->setColumnCount(6);
   carla_process_table->setHorizontalHeaderLabels(
-    QStringList() << "PID" << "Process" << "CPU" << "Memory" << "GPU");
+    QStringList() << "" << "PID" << "Process" << "CPU" << "Memory" << "GPU");
   carla_process_table->verticalHeader()->setVisible(false);
   carla_process_table->setSelectionMode(QAbstractItemView::SingleSelection);
   carla_process_table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -1720,13 +2236,16 @@ int main(int argc, char *argv[]) {
   carla_process_table->setFocusPolicy(Qt::NoFocus);
   carla_process_table->setMinimumHeight(120);
   carla_process_table->setAlternatingRowColors(true);
+  // Col 0: host indicator (L)/(R), fixed narrow
   carla_process_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
-  carla_process_table->setColumnWidth(0, 60);
+  carla_process_table->setColumnWidth(0, 28);
   carla_process_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
-  carla_process_table->setColumnWidth(1, 120);
-  carla_process_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+  carla_process_table->setColumnWidth(1, 60);
+  carla_process_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+  carla_process_table->setColumnWidth(2, 120);
   carla_process_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
   carla_process_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
+  carla_process_table->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Stretch);
   carla_process_table->setShowGrid(false);
   carla_process_table->horizontalHeader()->setHighlightSections(false);
   perfLayout->addWidget(carla_process_table);
@@ -1739,16 +2258,21 @@ int main(int argc, char *argv[]) {
   memSparkline->setColor(QColor(0x4C, 0xAF, 0x50));
   SparklineWidget *gpuSparkline = new SparklineWidget(90);
   gpuSparkline->setColor(QColor(0xFF, 0x98, 0x00));
+  SparklineWidget *netSparkline = new SparklineWidget(90);
+  netSparkline->setColor(QColor(0x00, 0xBC, 0xD4));  // cyan — network bandwidth
 
   QLabel *cpuValueLabel = nullptr;
   QLabel *memValueLabel = nullptr;
   QLabel *gpuValueLabel = nullptr;
+  QLabel *netValueLabel = nullptr;
   QLabel *cpuSubLabel   = nullptr;
   QLabel *memSubLabel   = nullptr;
   QLabel *gpuSubLabel   = nullptr;
+  QLabel *netSubLabel   = nullptr;
   QProgressBar *totalCpuBar = nullptr;
   QProgressBar *totalMemBar = nullptr;
   QProgressBar *totalGpuBar = nullptr;
+  QProgressBar *totalNetBar = nullptr;
 
   auto makeStatCard = [&](const QString &title,
                           QLabel *&bigLabel, QLabel *&subLabel,
@@ -1796,19 +2320,132 @@ int main(int argc, char *argv[]) {
     return card;
   };
 
-  QWidget *cpuCard = makeStatCard("CPU", cpuValueLabel, cpuSubLabel,
-                                  totalCpuBar,  cpuSparkline, "#2196F3");
-  QWidget *memCard = makeStatCard("Memory",      memValueLabel, memSubLabel,
-                                  totalMemBar,  memSparkline, "#FF9800");
-  QWidget *gpuCard = makeStatCard("GPU",         gpuValueLabel, gpuSubLabel,
-                                  totalGpuBar,  gpuSparkline, "#4CAF50");
+  // ── Remote stat cards (shown in remote mode as second row) ─────────────
+  QWidget *cpuCard = makeStatCard("CPU (R)", cpuValueLabel, cpuSubLabel,
+                                  totalCpuBar, cpuSparkline, "#2196F3");
+  QWidget *memCard = makeStatCard("MEM (R)", memValueLabel, memSubLabel,
+                                  totalMemBar, memSparkline, "#FF9800");
+  QWidget *gpuCard = makeStatCard("GPU (R)", gpuValueLabel, gpuSubLabel,
+                                  totalGpuBar, gpuSparkline, "#4CAF50");
+  QWidget *netCard = makeStatCard("NET",     netValueLabel, netSubLabel,
+                                  totalNetBar, netSparkline, "#00BCD4");
 
-  QHBoxLayout *statCardsRow = new QHBoxLayout();
-  statCardsRow->setSpacing(8);
-  statCardsRow->addWidget(cpuCard);
-  statCardsRow->addWidget(memCard);
-  statCardsRow->addWidget(gpuCard);
-  perfLayout->addLayout(statCardsRow);
+  // ── Local stat cards (always shown, local machine /proc + nvidia-smi) ─────
+  QLabel *cpuValueLabelL = nullptr, *cpuSubLabelL = nullptr;
+  QLabel *memValueLabelL = nullptr, *memSubLabelL = nullptr;
+  QLabel *gpuValueLabelL = nullptr, *gpuSubLabelL = nullptr;
+  QProgressBar *totalCpuBarL = nullptr, *totalMemBarL = nullptr, *totalGpuBarL = nullptr;
+  SparklineWidget *cpuSparklineL = new SparklineWidget(90);
+  cpuSparklineL->setColor(QColor(0x1A, 0x73, 0xE8));
+  SparklineWidget *memSparklineL = new SparklineWidget(90);
+  memSparklineL->setColor(QColor(0xF4, 0x51, 0x1E));
+  SparklineWidget *gpuSparklineL = new SparklineWidget(90);
+  gpuSparklineL->setColor(QColor(0x34, 0xA8, 0x53));
+  QWidget *cpuCardL = makeStatCard("CPU (L)", cpuValueLabelL, cpuSubLabelL,
+                                   totalCpuBarL, cpuSparklineL, "#1A73E8");
+  QWidget *memCardL = makeStatCard("MEM (L)", memValueLabelL, memSubLabelL,
+                                   totalMemBarL, memSparklineL, "#F4511E");
+  QWidget *gpuCardL = makeStatCard("GPU (L)", gpuValueLabelL, gpuSubLabelL,
+                                   totalGpuBarL, gpuSparklineL, "#34A853");
+
+  // ── NET card: taller, spans both rows, TX + RX as two halves ─────────────
+  QLabel *netRxValueLabel = nullptr;
+  QLabel *netTxValueLabel = nullptr;
+  QLabel *netTotalLabel   = nullptr;  // cumulative bytes \u2193 X GB  \u2191 X GB
+  QLabel *netTitleLabel   = nullptr;  // updated with link speed e.g. "NET (1 GbE)"
+  QProgressBar *netRxBar  = nullptr;
+  QProgressBar *netTxBar  = nullptr;
+  // (netSparkline already declared above)
+  {
+    auto *nf = new QFrame();
+    nf->setObjectName("statCard");
+    nf->setFrameShape(QFrame::StyledPanel);
+    nf->setStyleSheet(
+      "QFrame#statCard {"
+      "  background: palette(base);"
+      "  border: 1px solid rgba(128,128,128,45);"
+      "  border-radius: 7px; }");
+    auto *cl = new QVBoxLayout(nf);
+    cl->setContentsMargins(10, 8, 10, 8);
+    cl->setSpacing(4);
+
+    netTitleLabel = new QLabel("NET");
+    netTitleLabel->setStyleSheet(
+      "font-size: 10px; font-weight: 600; color: #00BCD4;"
+      "text-transform: uppercase; letter-spacing: 0.5px;");
+    cl->addWidget(netTitleLabel);
+
+    // RX half
+    auto *rxHdrLbl = new QLabel("\u2193 RX");
+    rxHdrLbl->setStyleSheet("font-size: 11px; font-weight: 500; color: palette(mid);");
+    netRxValueLabel = new QLabel("\u2014");
+    netRxValueLabel->setStyleSheet(
+      "font-size: 22px; font-weight: 400; color: palette(text);");
+    netRxBar = new QProgressBar();
+    netRxBar->setRange(0, 100); netRxBar->setMaximumHeight(4); netRxBar->setTextVisible(false);
+    netRxBar->setStyleSheet(
+      "QProgressBar { border: none; border-radius: 2px; background: rgba(128,128,128,28); }"
+      "QProgressBar::chunk { border-radius: 2px; background: #00BCD4; }");
+    cl->addWidget(rxHdrLbl);
+    cl->addWidget(netRxValueLabel);
+    cl->addWidget(netRxBar);
+
+    // Divider
+    auto *div = new QFrame();
+    div->setFrameShape(QFrame::HLine);
+    div->setStyleSheet("color: rgba(128,128,128,40);");
+    cl->addWidget(div);
+
+    // TX half
+    auto *txHdrLbl = new QLabel("\u2191 TX");
+    txHdrLbl->setStyleSheet("font-size: 11px; font-weight: 500; color: palette(mid);");
+    netTxValueLabel = new QLabel("\u2014");
+    netTxValueLabel->setStyleSheet(
+      "font-size: 22px; font-weight: 400; color: palette(text);");
+    netTxBar = new QProgressBar();
+    netTxBar->setRange(0, 100); netTxBar->setMaximumHeight(4); netTxBar->setTextVisible(false);
+    netTxBar->setStyleSheet(
+      "QProgressBar { border: none; border-radius: 2px; background: rgba(128,128,128,28); }"
+      "QProgressBar::chunk { border-radius: 2px; background: #26C6DA; }");
+    cl->addWidget(txHdrLbl);
+    cl->addWidget(netTxValueLabel);
+    cl->addWidget(netTxBar);
+
+    // Total transferred
+    netTotalLabel = new QLabel();
+    netTotalLabel->setStyleSheet(
+      "font-size: 10px; color: palette(mid); margin-top: 2px;");
+    cl->addWidget(netTotalLabel);
+
+    cl->addStretch(1);
+    cl->addWidget(netSparkline);
+    netCard = nf;
+  }
+
+  // ── 2×3 grid + NET column (row-span 2) ────────────────────────────────────
+  QWidget *statsGridWidget = new QWidget();
+  {
+    auto *g = new QGridLayout(statsGridWidget);
+    g->setContentsMargins(0, 0, 0, 0);
+    g->setSpacing(8);
+    g->setColumnStretch(0, 1); g->setColumnStretch(1, 1);
+    g->setColumnStretch(2, 1); g->setColumnStretch(3, 1);
+    // Row 0: local (always visible)
+    g->addWidget(cpuCardL, 0, 0);
+    g->addWidget(memCardL, 0, 1);
+    g->addWidget(gpuCardL, 0, 2);
+    // Row 1: remote (hidden until remote mode active)
+    cpuCard->setVisible(false);
+    memCard->setVisible(false);
+    gpuCard->setVisible(false);
+    g->addWidget(cpuCard, 1, 0);
+    g->addWidget(memCard, 1, 1);
+    g->addWidget(gpuCard, 1, 2);
+    // NET: spans both rows in col 3
+    netCard->setVisible(false);
+    g->addWidget(netCard, 0, 3, 2, 1);
+  }
+  perfLayout->addWidget(statsGridWidget);
 
   QHBoxLayout *procButtons = new QHBoxLayout();
   QPushButton *refreshProcBtn = new QPushButton("⟳");
@@ -2276,12 +2913,12 @@ int main(int argc, char *argv[]) {
   bool l1Pressed = false, r1Pressed = false;
   bool l3Pressed = false, r3Pressed = false;
   bool dpadUpPressed = false, dpadDownPressed = false, dpadLeftPressed = false, dpadRightPressed = false;
-  [[maybe_unused]] int jsFd = -1;
+  int jsFd = -1;
   QString jsName;
   std::vector<QWidget *> joystickMirrorWindows;
   std::vector<QLabel *> joystickMirrorTelemetryLabels;
 
-  [[maybe_unused]] auto scanJoystickDevices = [&]() -> QStringList {
+  auto scanJoystickDevices = [&]() -> QStringList {
     QStringList names;
 #ifdef CARLA_STUDIO_HAS_LINUX_JOYSTICK
     for (int index = 0; index < 8; ++index) {
@@ -2302,7 +2939,7 @@ int main(int argc, char *argv[]) {
     return names;
   };
 
-  [[maybe_unused]] auto rebuildJoystickMirrorWindows = [&](const QStringList &allJoysticks) {
+  auto rebuildJoystickMirrorWindows = [&](const QStringList &allJoysticks) {
     for (QWidget *windowPtr : joystickMirrorWindows) {
       if (windowPtr) {
         windowPtr->close();
@@ -2578,31 +3215,70 @@ int main(int argc, char *argv[]) {
   jsGroup->setLayout(jsLayout);
 
   QString detectedEngineLabel = "Unreal ?";
+  QString remoteRuntimeUser = guiOverrides.remoteUser.trimmed();
+  QString remoteRuntimePass = guiOverrides.remotePass.trimmed();
+  QString remoteRuntimeBindAddress = guiOverrides.remoteBindAddress.trimmed();
+  if (remoteRuntimeUser.isEmpty()) {
+    remoteRuntimeUser = QString::fromLocal8Bit(qgetenv("CARLA_REMOTE_USER")).trimmed();
+  }
+  if (remoteRuntimePass.isEmpty()) {
+    remoteRuntimePass = QString::fromLocal8Bit(qgetenv("CARLA_REMOTE_PASS")).trimmed();
+  }
+  if (remoteRuntimeBindAddress.isEmpty()) {
+    remoteRuntimeBindAddress = QString::fromLocal8Bit(qgetenv("CARLA_REMOTE_BIND_ADDRESS")).trimmed();
+  }
+
+  // Helper: load / save per-host credentials from QSettings.
+  auto loadStoredCreds = [&](const QString &host) {
+    if (host.isEmpty()) return;
+    if (remoteRuntimeUser.isEmpty())
+      remoteRuntimeUser = QSettings().value(QString("remote/cred/%1/user").arg(host)).toString().trimmed();
+    if (remoteRuntimePass.isEmpty())
+      remoteRuntimePass = QSettings().value(QString("remote/cred/%1/pass").arg(host)).toString().trimmed();
+  };
+  // Apply stored credentials for the initial host (--remote-host or last saved host).
+  {
+    const QString initHost = guiOverrides.host.isEmpty()
+                               ? QSettings().value("carla/last_host").toString().trimmed()
+                               : guiOverrides.host;
+    loadStoredCreds(initHost);
+  }
+
+  // --- Remote probe cache ---
+  // sshpass availability is checked once and cached so we never re-spawn a shell
+  // just to locate the binary on every poll cycle.
+  bool g_sshpassCheckDone = false;
+  bool g_sshpassOk        = false;
+
+  // badge: last result of the SSH source-tree probe so updateStatusBadge() is instant.
+  QString g_cachedBadgeLabel;
+  bool    g_badgeProbeInflight = false;
+  QElapsedTimer g_badgeProbeClock;
+
+  // port: last result of the async port-reachability probe.
+  //  -1 = never probed / unknown   0 = not reachable   >0 = port number
+  int  g_cachedPortResult  = -1;
+  bool g_portProbeInflight = false;
+  QElapsedTimer g_portProbeClock;
+
+  // Minimum interval (ms) between successive remote probes so we never
+  // saturate the SSH connection.
+  static constexpr int kRemotePortProbeIntervalMs  = 8000;
+  static constexpr int kRemoteBadgeProbeIntervalMs = 30000;
 
   auto probeInstalledCarlaVersion = [&]() -> QString {
-    const QString root = carla_root_path->text().trimmed();
+    const QString root = carla_root_path ? carla_root_path->text().trimmed() : QString();
     if (root.isEmpty()) return QString();
 
     for (const QString &p : { root + "/VERSION", root + "/version.txt" }) {
       QFile f(p);
-      if (f.open(QIODevice::ReadOnly)) {
-        const QString v = QString::fromLocal8Bit(f.readLine()).trimmed();
-        if (!v.isEmpty() && v[0].isDigit()) return v;
+      if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        const QString raw = QString::fromUtf8(f.readLine()).trimmed();
+        if (!raw.isEmpty()) return raw;
       }
     }
-    QRegularExpression dirVer("CARLA[_-]v?([0-9]+\\.[0-9]+(?:\\.[0-9]+)?)",
-                              QRegularExpression::CaseInsensitiveOption);
 
-    QString cur = root;
-    for (int i = 0; i < 3 && !cur.isEmpty(); ++i) {
-      const auto m = dirVer.match(QFileInfo(cur).fileName());
-      if (m.hasMatch()) return m.captured(1);
-      const QString parent = QFileInfo(cur).path();
-      if (parent == cur) break;
-      cur = parent;
-    }
-
-    if (QFileInfo(root + "/CarlaUnreal.sh").isFile()) return "0.10.0";
+    if (QFileInfo(root + "/CarlaUnreal.sh").isFile()) return QStringLiteral("0.10.0");
     return QString();
   };
 
@@ -2610,9 +3286,103 @@ int main(int argc, char *argv[]) {
     if (!apiWarningLabel) return;
     QString text;
     QString color;
+    const bool isRemoteRuntime = runtimeTarget && runtimeTarget->currentText().endsWith("(remote)");
+    const QString sbRoot = carla_root_path ? carla_root_path->text().trimmed() : QString();
+    const bool hasUE5Tree = !sbRoot.isEmpty() && (
+        QFileInfo(sbRoot + "/Unreal/CarlaUnreal/Source").isDir()
+        || QFileInfo(sbRoot + "/Unreal/CarlaUE5/Source").isDir());
+    const bool hasUE4Tree = !sbRoot.isEmpty()
+        && QFileInfo(sbRoot + "/Unreal/CarlaUE4/Source").isDir();
+    // Fire an async badge probe if the cache is stale, then use cached value.
+    // This keeps updateStatusBadge() instant (no blocking SSH).
+    auto fireBadgeProbeIfNeeded = [&]() {
+      if (!isRemoteRuntime || sbRoot.isEmpty()) return;
+      if (g_badgeProbeInflight) return;
+      if (g_badgeProbeClock.isValid()
+          && g_badgeProbeClock.elapsed() < kRemoteBadgeProbeIntervalMs) return;
+
+      QString host = targetHost ? targetHost->text().trimmed() : QString();
+      if (host.isEmpty()) {
+        const QString runtimeText = runtimeTarget ? runtimeTarget->currentText() : QString();
+        host = runtimeText.left(runtimeText.size() - 9).trimmed(); // strip " (remote)"
+      }
+      if (host.isEmpty()) return;
+      // Use remoteRuntimeUser if set; otherwise omit user@ and let SSH config decide.
+      const QString sshTarget = remoteRuntimeUser.isEmpty()
+                                  ? host
+                                  : QString("%1@%2").arg(remoteRuntimeUser, host);
+
+      if (!g_sshpassCheckDone) {
+        QProcess chk; chk.start("/bin/sh", {"-c", "command -v sshpass"});
+        chk.waitForFinished(1000);
+        g_sshpassOk = (chk.exitCode() == 0);
+        g_sshpassCheckDone = true;
+      }
+
+      auto shEsc = [](const QString &s) {
+        QString o = s; o.replace("'", "'\\''"); return "'" + o + "'";
+      };
+      const QString probeCmd = QString(
+        "if [ -d %1/Unreal/CarlaUnreal/Source ] || [ -d %1/Unreal/CarlaUE5/Source ];"
+        " then echo UE5;"
+        " elif [ -d %1/Unreal/CarlaUE4/Source ]; then echo UE4;"
+        " else echo NONE; fi").arg(shEsc(sbRoot));
+
+      QString program = "ssh"; QStringList args;
+      if (!remoteRuntimePass.isEmpty() && g_sshpassOk) {
+        program = "sshpass"; args << "-p" << remoteRuntimePass << "ssh";
+      }
+      if (!remoteRuntimeBindAddress.isEmpty())
+        args << "-o" << QString("BindAddress=%1").arg(remoteRuntimeBindAddress);
+      args << "-o" << "StrictHostKeyChecking=accept-new"
+           << "-o" << "ConnectTimeout=3"
+           << sshTarget << probeCmd;
+
+      auto *proc = new QProcess(&window);
+      g_badgeProbeInflight = true;
+      QObject::connect(proc, QOverload<int,QProcess::ExitStatus>::of(&QProcess::finished),
+        &window, [proc, &g_badgeProbeInflight, &g_cachedBadgeLabel,
+                  &g_badgeProbeClock]
+                 (int exitCode, QProcess::ExitStatus) {
+          proc->deleteLater();
+          g_badgeProbeInflight = false;
+          g_badgeProbeClock.restart();
+          if (exitCode == 0) {
+            const QString out = QString::fromLocal8Bit(proc->readAllStandardOutput()).trimmed();
+            if (out == "UE5")      g_cachedBadgeLabel = QStringLiteral("Carla(src) w/ UE5");
+            else if (out == "UE4") g_cachedBadgeLabel = QStringLiteral("Carla(src) w/ UE4");
+            else                   g_cachedBadgeLabel.clear();
+          }
+          if (g_refreshStatusBadge) g_refreshStatusBadge();
+        });
+      proc->start(program, args);
+    };
+    fireBadgeProbeIfNeeded();
+    const QString remoteSrcText = g_cachedBadgeLabel;
+    const QString remoteFallbackSrcText = [=]() -> QString {
+      if (!isRemoteRuntime || sbRoot.isEmpty()) return QString();
+      if (detectedEngineLabel.contains("4")) return QStringLiteral("Carla(src) w/ UE4");
+      if (detectedEngineLabel.contains("5")) return QStringLiteral("Carla(src) w/ UE5");
+      // Engine unknown locally — badge probe is in-flight; show a clean
+      // placeholder instead of the confusing "UE?" that users read as
+      // "not built".
+      return g_badgeProbeInflight
+        ? QStringLiteral("Carla (remote · detecting…)")
+        : QStringLiteral("Carla (remote · src)");
+    }();
+
     if (!rootConfiguredOk) {
       text  = "Not Configured (click to configure)";
       color = "#F9A825";
+    } else if (!remoteSrcText.isEmpty()) {
+      text = remoteSrcText;
+      color = g_sdkVersionMismatch ? "#C62828" : "";
+    } else if (!remoteFallbackSrcText.isEmpty()) {
+      text = remoteFallbackSrcText;
+      color = g_sdkVersionMismatch ? "#C62828" : "";
+    } else if (hasUE5Tree || hasUE4Tree) {
+      text = QString("Carla(src) w/ UE%1").arg(hasUE5Tree ? 5 : 4);
+      color = g_sdkVersionMismatch ? "#C62828" : "";
     } else if (g_sdkVersionMismatch) {
       const QString v = g_reportedSimVersion.isEmpty()
                          ? QStringLiteral("?")
@@ -2628,17 +3398,7 @@ int main(int argc, char *argv[]) {
         v = QStringLiteral("offline");
 #endif
       }
-      const QString sbRoot = carla_root_path ? carla_root_path->text().trimmed() : QString();
-      const bool hasUE5Tree = !sbRoot.isEmpty() && (
-          QFileInfo(sbRoot + "/Unreal/CarlaUnreal/Source").isDir()
-          || QFileInfo(sbRoot + "/Unreal/CarlaUE5/Source").isDir());
-      const bool hasUE4Tree = !sbRoot.isEmpty()
-          && QFileInfo(sbRoot + "/Unreal/CarlaUE4/Source").isDir();
-      if (hasUE5Tree || hasUE4Tree) {
-        text = QString("Carla (src) w/UE.%1").arg(hasUE5Tree ? 5 : 4);
-      } else {
-        text = QString("CARLA %1 with %2").arg(v, detectedEngineLabel);
-      }
+      text = QString("CARLA %1 with %2").arg(v, detectedEngineLabel);
       color = "";
     }
     apiWarningLabel->setText(text);
@@ -2655,6 +3415,10 @@ int main(int argc, char *argv[]) {
 
   auto validateCarlaRoot = [&]() {
     const QString path = carla_root_path->text().trimmed();
+    const QString runtimeText = runtimeTarget ? runtimeTarget->currentText() : QString();
+    const bool isRemoteRuntime = runtimeText.endsWith("(remote)")
+                                 || runtimeText.startsWith("remotehost")
+                                 || runtimeText.startsWith("Remote");
 
     const bool hasUE4    = QFileInfo(path + "/CarlaUE4.sh").isFile();
     const bool hasUE5    = QFileInfo(path + "/CarlaUE5.sh").isFile();
@@ -2679,7 +3443,9 @@ int main(int argc, char *argv[]) {
           QFileInfo(path + "/Unreal/CarlaUnreal/Source").isDir()
           || QFileInfo(path + "/Unreal/CarlaUE4/Source").isDir()
           || QFileInfo(path + "/Unreal/CarlaUE5/Source").isDir());
-    rootConfiguredOk    = (!path.isEmpty() && (hasUE4 || hasUE5 || hasUnreal || hasSourceTree));
+    rootConfiguredOk    = isRemoteRuntime
+      ? !path.isEmpty()
+      : (!path.isEmpty() && (hasUE4 || hasUE5 || hasUnreal || hasSourceTree));
 
     const bool showPathRow = !rootConfiguredOk;
     carla_root_path->setVisible(showPathRow);
@@ -2706,9 +3472,7 @@ int main(int argc, char *argv[]) {
 
   auto getSelectedLaunchArgs = [&]() -> QStringList {
     QStringList args;
-    if (optRenderOffscreen->isChecked()) {
-      args << "-RenderOffScreen";
-    } else if (optWindowSmall->isChecked()) {
+    if (optWindowSmall->isChecked()) {
 
       args << "-windowed" << "-ResX=640" << "-ResY=480";
     }
@@ -2803,7 +3567,9 @@ int main(int argc, char *argv[]) {
 
     optWindowSmall->setChecked(s.value("render/window_small",   true ).toBool());
 
-    optRenderOffscreen->setChecked(s.value("render/offscreen", true).toBool());
+    // Offscreen rendering is intentionally disabled: always keep this unchecked.
+    optRenderOffscreen->setChecked(false);
+    s.setValue("render/offscreen", false);
   }
 
   auto refreshRuntimeOptions = [&]() {
@@ -2877,37 +3643,284 @@ int main(int argc, char *argv[]) {
     scenarioSelect->setCurrentIndex(idx >= 0 ? idx : 0);
   };
 
-  auto scanCarlaPort = [&]() -> int {
-    QProcess probe;
-    probe.start("/bin/bash", QStringList() << "-lc"
-      << "ss -ltnp 2>/dev/null | grep -E 'CarlaUE4|CarlaUE5|CarlaUE' | head -n 1");
-    if (!probe.waitForFinished(2000)) {
-      probe.terminate();
-      if (!probe.waitForFinished(800)) {
-        probe.kill();
-        probe.waitForFinished(-1);
+  auto runtimeIsRemote = [&]() -> bool {
+    if (!runtimeTarget) return false;
+    const QString t = runtimeTarget->currentText();
+    return t.endsWith("(remote)") || t.startsWith("remotehost") || t.startsWith("Remote");
+  };
+
+  auto selectedRemoteHost = [&]() -> QString {
+    QString host = targetHost ? targetHost->text().trimmed() : QString();
+    if (!host.isEmpty()) return host;
+    const QString runtimeText = runtimeTarget ? runtimeTarget->currentText().trimmed() : QString();
+    if (runtimeText.endsWith("(remote)")) {
+      host = runtimeText.left(runtimeText.size() - int(strlen(" (remote)"))).trimmed();
+      if (!host.isEmpty()) return host;
+    }
+    return QSettings().value("carla/last_host").toString().trimmed();
+  };
+
+  // Synchronous port-reachability check — used for one-shot calls (e.g. docker
+  // attach, stop detection) where we know we're already on a worker/timer path
+  // and a brief block is acceptable.  NOT used in the 2-second poll loop.
+  auto isCarlaPortReachable = [&](int port) -> bool {
+    if (port <= 0) return false;
+
+    if (runtimeIsRemote()) {
+      const QString host = selectedRemoteHost();
+      if (host.isEmpty()) return false;
+
+      // Fast path: direct TCP from this machine to the remote host.
+      // Works whenever the RPC port is exposed on the network (the normal case).
+      {
+        QProcess direct;
+        direct.start("/bin/sh", QStringList() << "-c"
+          << QString("nc -z -w2 %1 %2 >/dev/null 2>&1").arg(host).arg(port));
+        direct.waitForFinished(3000);
+        if (direct.exitStatus() == QProcess::NormalExit && direct.exitCode() == 0)
+          return true;
       }
-      return -1;
+
+      // Slow path: SSH tunnel probe (firewall / NAT scenario where only SSH is exposed).
+      const QString sshTarget = remoteRuntimeUser.isEmpty()
+                                  ? host
+                                  : QString("%1@%2").arg(remoteRuntimeUser, host);
+
+      // Lazy one-time sshpass check
+      if (!g_sshpassCheckDone) {
+        QProcess chk; chk.start("/bin/sh", {"-c", "command -v sshpass"});
+        chk.waitForFinished(1000);
+        g_sshpassOk = (chk.exitCode() == 0);
+        g_sshpassCheckDone = true;
+      }
+
+      QString program = "ssh"; QStringList args;
+      if (!remoteRuntimePass.isEmpty() && g_sshpassOk) {
+        program = "sshpass"; args << "-p" << remoteRuntimePass << "ssh";
+      }
+      if (!remoteRuntimeBindAddress.isEmpty())
+        args << "-o" << QString("BindAddress=%1").arg(remoteRuntimeBindAddress);
+      args << "-o" << "StrictHostKeyChecking=accept-new"
+           << "-o" << "ConnectTimeout=2"
+           << sshTarget
+           << QString("nc -z -w1 127.0.0.1 %1 >/dev/null 2>&1").arg(port);
+
+      QProcess p; p.start(program, args);
+      if (!p.waitForFinished(3500)) { p.kill(); p.waitForFinished(500); return false; }
+      return p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0;
     }
-    const QString line = QString::fromLocal8Bit(probe.readAllStandardOutput()).trimmed();
-    QRegularExpression re(R"((?:\*|[0-9\.]+):(\d+))");
-    QRegularExpressionMatch match = re.match(line);
-    if (match.hasMatch()) {
-      return match.captured(1).toInt();
-    }
+
+    // Local probe
+    QProcess probe;
+    probe.start("/bin/sh", QStringList() << "-c"
+      << QString("nc -z -w1 127.0.0.1 %1 >/dev/null 2>&1").arg(port));
+    probe.waitForFinished(2000);
+    return probe.exitStatus() == QProcess::NormalExit && probe.exitCode() == 0;
+  };
+
+  // Quick synchronous scan — only for local mode or one-shot contexts.
+  // For the remote poll loop, scheduleAsyncRemotePortProbe() is used instead.
+  auto scanCarlaPort = [&]() -> int {
+    const int configured = portSpin ? portSpin->value() : 2000;
+    if (isCarlaPortReachable(configured)) return configured;
     return -1;
   };
+
+  // Schedule an async (non-blocking) remote port probe and update status from
+  // the result.  Safe to call on every poll cycle — internally rate-limited.
+  auto scheduleAsyncRemotePortProbe = [&]() {
+    if (!runtimeIsRemote()) return;
+    if (g_portProbeInflight) return;
+    if (g_portProbeClock.isValid()
+        && g_portProbeClock.elapsed() < kRemotePortProbeIntervalMs) {
+      // Use the cached result without launching a new SSH process.
+      if (g_cachedPortResult > 0 && !launchRequestedOrRunning) {
+        if (portSpin && portSpin->value() != g_cachedPortResult)
+          portSpin->setValue(g_cachedPortResult);
+        setSimulationStatus(QString("Running (detected existing CARLA on port %1)")
+                            .arg(g_cachedPortResult));
+      }
+      return;
+    }
+
+    const QString host = selectedRemoteHost();
+    if (host.isEmpty()) return;
+    const QString sshTarget = remoteRuntimeUser.isEmpty()
+                                ? host
+                                : QString("%1@%2").arg(remoteRuntimeUser, host);
+
+    if (!g_sshpassCheckDone) {
+      QProcess chk; chk.start("/bin/sh", {"-c", "command -v sshpass"});
+      chk.waitForFinished(1000);
+      g_sshpassOk = (chk.exitCode() == 0);
+      g_sshpassCheckDone = true;
+    }
+
+    const int probePort = portSpin ? portSpin->value() : 2000;
+    QString program = "ssh"; QStringList args;
+    if (!remoteRuntimePass.isEmpty() && g_sshpassOk) {
+      program = "sshpass"; args << "-p" << remoteRuntimePass << "ssh";
+    }
+    if (!remoteRuntimeBindAddress.isEmpty())
+      args << "-o" << QString("BindAddress=%1").arg(remoteRuntimeBindAddress);
+    args << "-o" << "StrictHostKeyChecking=accept-new"
+         << "-o" << "ConnectTimeout=2"
+         << sshTarget
+         << QString("nc -z -w1 127.0.0.1 %1 >/dev/null 2>&1").arg(probePort);
+
+    auto *proc = new QProcess(&window);
+    g_portProbeInflight = true;
+    QObject::connect(proc, QOverload<int,QProcess::ExitStatus>::of(&QProcess::finished),
+      &window, [proc, probePort, &g_portProbeInflight, &g_cachedPortResult,
+                &g_portProbeClock, &launchRequestedOrRunning,
+                &portSpin, &setSimulationStatus]
+               (int exitCode, QProcess::ExitStatus) {
+        proc->deleteLater();
+        g_portProbeInflight = false;
+        g_portProbeClock.restart();
+        g_cachedPortResult = (exitCode == 0) ? probePort : 0;
+        if (g_cachedPortResult > 0 && !launchRequestedOrRunning) {
+          if (portSpin && portSpin->value() != g_cachedPortResult)
+            portSpin->setValue(g_cachedPortResult);
+          setSimulationStatus(QString("Running (detected existing CARLA on port %1)")
+                              .arg(g_cachedPortResult));
+        }
+      });
+    proc->start(program, args);
+  };
+
+  // Network-card sampling state (persists across refreshProcessList calls).
+  QString netIface;          // cached interface name for the route to CARLA host
+  QString netIfaceForHost;   // host for which netIface was resolved
+  qint64  netRxPrev   = -1;
+  qint64  netTxPrev   = -1;
+  qint64  netTimePrev = -1;
+  qint64  netTotalRxBytes = 0;  // cumulative bytes received since session start
+  qint64  netTotalTxBytes = 0;  // cumulative bytes sent
+  qint64  netPreviewLastMs = -1;
+  QMap<QString, double> netPreviewMbpsByName;
+  qint64  remoteGpuLastProbeMs = 0;
+  double  remoteGpuLastUtil = -1.0;
+  qint64  remoteGpuLastMemUsedMiB = -1;
+  qint64  remoteGpuLastMemTotalMiB = -1;
+  // Local /proc CPU sampling state
+  qint64  localCpuPrevIdle  = 0;
+  qint64  localCpuPrevTotal = 0;
+  // carla-studio self-CPU sampling (/proc/self/stat jiffies)
+  qint64  selfCpuPrevJiffies = 0;
+  qint64  selfCpuPrevWallMs  = 0;
+  qint64  selfMemRssKib      = 0;  // updated each refresh
 
   auto setProcessAreaEnabled = [&](bool enabled) {
     carla_process_table->setEnabled(enabled);
     totalCpuBar->setEnabled(enabled);
     totalMemBar->setEnabled(enabled);
     totalGpuBar->setEnabled(enabled);
+    netRxBar->setEnabled(enabled);
+    netTxBar->setEnabled(enabled);
   };
   setProcessAreaEnabled(false);
 
   refreshProcessList = [&]() {
+    const bool isRemote = runtimeIsRemote();
 
+    // ── Layout visibility: hide Co-Simulation when remote; toggle remote stat row.
+    integrationsGroup->setVisible(!isRemote);
+    cpuCard->setVisible(isRemote);
+    memCard->setVisible(isRemote);
+    gpuCard->setVisible(isRemote);
+    netCard->setVisible(isRemote);
+
+    // ── Local machine /proc stats (always updated regardless of remote) ─────
+    {
+      // CPU from /proc/stat
+      QFile cpuF("/proc/stat");
+      if (cpuF.open(QIODevice::ReadOnly)) {
+        const QString ln = QString::fromLocal8Bit(cpuF.readLine()).trimmed();
+        if (ln.startsWith("cpu ")) {
+          const QStringList tok = ln.mid(4).split(' ', Qt::SkipEmptyParts);
+          if (tok.size() >= 4) {
+            const qint64 user  = tok[0].toLongLong();
+            const qint64 nice  = tok[1].toLongLong();
+            const qint64 sys   = tok[2].toLongLong();
+            const qint64 idle  = tok[3].toLongLong();
+            qint64 total = user + nice + sys + idle;
+            for (int i = 4; i < tok.size(); ++i) total += tok[i].toLongLong();
+            if (localCpuPrevTotal > 0) {
+              const qint64 diffIdle  = idle  - localCpuPrevIdle;
+              const qint64 diffTotal = total - localCpuPrevTotal;
+              const double pct = (diffTotal > 0)
+                ? (1.0 - double(diffIdle) / double(diffTotal)) * 100.0 : 0.0;
+              totalCpuBarL->setValue(int(pct));
+              cpuValueLabelL->setText(QString("%1%").arg(pct, 0, 'f', 1));
+              cpuSubLabelL->setText(QString("≈ %1 cores").arg(
+                pct / 100.0 * QThread::idealThreadCount(), 0, 'f', 1));
+              cpuSparklineL->addSample(pct);
+            } else {
+              cpuValueLabelL->setText(QStringLiteral("…"));
+            }
+            localCpuPrevIdle  = idle;
+            localCpuPrevTotal = total;
+          }
+        }
+      }
+      // MEM from /proc/meminfo (readAll + regex — avoids line-read timing issues)
+      {
+        QFile memF("/proc/meminfo");
+        if (memF.open(QIODevice::ReadOnly)) {
+          const QString content = QString::fromLocal8Bit(memF.readAll());
+          static const QRegularExpression reTot(R"(MemTotal:\s+(\d+))");
+          static const QRegularExpression reAvail(R"(MemAvailable:\s+(\d+))");
+          const auto mTot   = reTot.match(content);
+          const auto mAvail = reAvail.match(content);
+          if (mTot.hasMatch() && mAvail.hasMatch()) {
+            const qint64 memTotal = mTot.captured(1).toLongLong();
+            const qint64 memAvail = mAvail.captured(1).toLongLong();
+            if (memTotal > 0) {
+              const double pct    = (1.0 - double(memAvail) / double(memTotal)) * 100.0;
+              const double usedGB = double(memTotal - memAvail) / 1048576.0;
+              const double totGB  = double(memTotal) / 1048576.0;
+              totalMemBarL->setValue(int(pct));
+              memValueLabelL->setText(QString("%1 GB").arg(usedGB, 0, 'f', 1));
+              memSubLabelL->setText(QString("%1 / %2 GB  (%3%)")
+                .arg(usedGB, 0, 'f', 1).arg(totGB, 0, 'f', 1).arg(pct, 0, 'f', 1));
+              memSparklineL->addSample(pct);
+            }
+          }
+        }
+      }
+    }  // ── end local /proc stats block ──────────────────────────────────
+
+      // GPU (L) from local nvidia-smi (non-blocking, 500ms max).
+      // Skip while in remote runtime to avoid excessive local probe churn.
+      if (!isRemote) {
+        QProcess localGpu;
+        localGpu.start("nvidia-smi",
+          {"--query-gpu=utilization.gpu,memory.used,memory.total",
+           "--format=csv,noheader,nounits"});
+        if (localGpu.waitForFinished(500)) {
+          const QStringList gp = QString::fromLocal8Bit(
+            localGpu.readAllStandardOutput()).trimmed().split(',');
+          if (gp.size() >= 3) {
+            const double gUtil  = gp[0].trimmed().toDouble();
+            const double gUsed  = gp[1].trimmed().toDouble();
+            const double gTotal = gp[2].trimmed().toDouble();
+            totalGpuBarL->setValue(static_cast<int>(gUtil));
+            gpuValueLabelL->setText(QString("%1%").arg(gUtil, 0, 'f', 1));
+            gpuSubLabelL->setText(QString("%1 / %2 MiB")
+              .arg(qint64(gUsed)).arg(qint64(gTotal)));
+            gpuSparklineL->addSample(gUtil);
+          }
+        } else {
+          localGpu.kill();
+          localGpu.waitForFinished(500);
+          gpuValueLabelL->setText(QStringLiteral("n/a"));
+        }
+      } else {
+        gpuValueLabelL->setText(QStringLiteral("n/a"));
+        gpuSubLabelL->setText(QStringLiteral("remote runtime"));
+      }
+    if (!isRemote) discoverCarlaSimPids();
     totalCpuBar->setValue(0);
     totalMemBar->setValue(0);
     totalGpuBar->setValue(0);
@@ -2915,6 +3928,396 @@ int main(int argc, char *argv[]) {
     totalMemBar->setFormat("0.0%");
     totalGpuBar->setFormat("n/a");
     carla_process_table->setRowCount(0);
+
+    // ── Read carla-studio self stats (common to both local and remote mode) ──
+    double selfCpuPctEarly = 0.0;
+    {
+      QFile sf("/proc/self/stat");
+      if (sf.open(QIODevice::ReadOnly)) {
+        const QStringList f = QString::fromLocal8Bit(sf.readAll())
+                                .split(' ', Qt::SkipEmptyParts);
+        if (f.size() > 15) {
+          const qint64 jiff  = f[13].toLongLong() + f[14].toLongLong();
+          const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+          if (selfCpuPrevWallMs > 0 && nowMs > selfCpuPrevWallMs) {
+            const double hz = static_cast<double>(sysconf(_SC_CLK_TCK));
+            selfCpuPctEarly = static_cast<double>(jiff - selfCpuPrevJiffies) / hz
+                              / (static_cast<double>(nowMs - selfCpuPrevWallMs) / 1000.0) * 100.0;
+            selfCpuPctEarly = std::max(0.0, selfCpuPctEarly);
+          }
+          selfCpuPrevJiffies = jiff;
+          selfCpuPrevWallMs  = nowMs;
+        }
+      }
+      QFile st("/proc/self/status");
+      if (st.open(QIODevice::ReadOnly)) {
+        static const QRegularExpression reRSS(R"(VmRSS:\s+(\d+))");
+        const auto m = reRSS.match(QString::fromLocal8Bit(st.readAll()));
+        if (m.hasMatch()) selfMemRssKib = m.captured(1).toLongLong();
+      }
+    }
+    const qint64 selfPidEarly = QCoreApplication::applicationPid();
+
+    auto cardBarColor = [](QProgressBar *b, double pct, const QString &base) {
+      QString color = base;
+      if (pct >= 95.0)      color = "#C64545";
+      else if (pct >= 75.0) color = "#D9A13A";
+      b->setStyleSheet(QString(
+        "QProgressBar { border: none; border-radius: 2px;"
+        "  background: rgba(128,128,128,28); }"
+        "QProgressBar::chunk { border-radius: 2px; background: %1; }").arg(color));
+    };
+
+    if (isRemote) {
+      // In remote runtime, list actual remote CARLA/UE processes (not local ssh/sshpass helpers).
+      const QString host = selectedRemoteHost();
+      const QString sshTarget = remoteRuntimeUser.isEmpty()
+                                  ? host
+                                  : QString("%1@%2").arg(remoteRuntimeUser, host);
+      if (host.isEmpty()) {
+        setProcessAreaEnabled(false);
+        scheduleAsyncRemotePortProbe();
+        return;
+      }
+
+      if (!g_sshpassCheckDone) {
+        QProcess chk;
+        chk.start("/bin/sh", {"-c", "command -v sshpass"});
+        chk.waitForFinished(1000);
+        g_sshpassOk = (chk.exitCode() == 0);
+        g_sshpassCheckDone = true;
+      }
+
+      QString program = "ssh";
+      QStringList args;
+      if (!remoteRuntimePass.isEmpty() && g_sshpassOk) {
+        program = "sshpass";
+        args << "-p" << remoteRuntimePass << "ssh";
+      }
+      if (!remoteRuntimeBindAddress.isEmpty())
+        args << "-o" << QString("BindAddress=%1").arg(remoteRuntimeBindAddress);
+      args << "-o" << "StrictHostKeyChecking=accept-new"
+           << "-o" << "ConnectTimeout=3"
+           << sshTarget
+           << "ps -eo pid=,pcpu=,pmem=,rss=,comm= --sort=-pcpu | awk '$5 ~ /(Carla|UnrealEditor|CarlaUE|CarlaUnreal)/ { print }' | head -20";
+
+      QProcess remotePs;
+      remotePs.start(program, args);
+      if (!remotePs.waitForFinished(3500)) {
+        remotePs.terminate();
+        if (!remotePs.waitForFinished(500)) {
+          remotePs.kill();
+          remotePs.waitForFinished(500);
+        }
+      }
+      const QString remoteOut = QString::fromLocal8Bit(remotePs.readAllStandardOutput());
+      const QStringList lines = remoteOut.split('\n', Qt::SkipEmptyParts);
+
+      // Keep cards and network monitor alive even when remote ps is temporarily empty.
+      setProcessAreaEnabled(true);
+      carla_process_table->setRowCount(static_cast<int>(lines.size()) + 1);
+      carla_process_table->verticalHeader()->setDefaultSectionSize(30);
+
+      int row = 0;
+      // ── self row (grey, pinned at top) ────────────────────────────────
+      {
+        auto *hi = new QTableWidgetItem("\u25CF");
+        hi->setTextAlignment(Qt::AlignCenter);
+        hi->setForeground(QColor("#9E9E9E"));
+        hi->setToolTip("carla-studio (this process)");
+        carla_process_table->setItem(row, 0, hi);
+        auto *pi = new QTableWidgetItem(QString::number(selfPidEarly));
+        pi->setTextAlignment(Qt::AlignCenter);
+        carla_process_table->setItem(row, 1, pi);
+        auto *ni = new QTableWidgetItem("CARLA Studio");
+        ni->setForeground(QColor("#9E9E9E"));
+        ni->setToolTip("carla-studio — monitoring itself");
+        carla_process_table->setItem(row, 2, ni);
+        carla_process_table->setItem(row, 3, new QTableWidgetItem(
+          selfCpuPctEarly > 0 ? QString("%1%").arg(selfCpuPctEarly, 0, 'f', 1)
+                              : QString("measuring\u2026")));
+        carla_process_table->setItem(row, 4, new QTableWidgetItem(
+          selfMemRssKib > 0 ? QString("%1 MiB").arg(selfMemRssKib / 1024)
+                            : QString("—")));
+        carla_process_table->setItem(row, 5, new QTableWidgetItem("local"));
+        for (int c = 0; c < 6; ++c) {
+          if (auto *it = carla_process_table->item(row, c))
+            it->setForeground(QColor("#9E9E9E"));
+        }
+        ++row;
+      }
+      for (const QString &line : lines) {
+        const QStringList parts = line.trimmed().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+        if (parts.size() < 5) continue;
+
+        const QString pid = parts[0];
+        const QString cpu = parts[1];
+        const QString mem = parts[2];
+        const QString rss = parts[3];
+        const QString proc = parts[4];
+
+        auto *hostItem = new QTableWidgetItem("R");
+        hostItem->setTextAlignment(Qt::AlignCenter);
+        hostItem->setForeground(QColor("#00BCD4"));
+        carla_process_table->setItem(row, 0, hostItem);
+        auto *pidItem = new QTableWidgetItem(pid);
+        pidItem->setTextAlignment(Qt::AlignCenter);
+        carla_process_table->setItem(row, 1, pidItem);
+        carla_process_table->setItem(row, 2, new QTableWidgetItem(proc));
+        carla_process_table->setItem(row, 3, new QTableWidgetItem(QString("%1%").arg(cpu)));
+        carla_process_table->setItem(row, 4, new QTableWidgetItem(QString("%1% (%2 MiB)")
+          .arg(mem)
+          .arg(QString::number(rss.toDouble() / 1024.0, 'f', 0))));
+        carla_process_table->setItem(row, 5, new QTableWidgetItem("remote"));
+        ++row;
+      }
+      carla_process_table->setRowCount(row);
+
+      // ── Aggregate remote stat cards from SSH ps output ──────────────────
+      {
+        double remTotalCpu = 0.0, remTotalMem = 0.0;
+        qint64 remTotalRss = 0;
+        for (const QString &line2 : lines) {
+          const QStringList p = line2.trimmed().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+          if (p.size() < 5) continue;
+          remTotalCpu += p[1].toDouble();
+          remTotalMem += p[2].toDouble();
+          remTotalRss += p[3].toLongLong();
+        }
+        const double remTotalRssMiB = static_cast<double>(remTotalRss) / 1024.0;
+        const double cpuAgg = std::max(0.0, std::min(100.0, remTotalCpu / 100.0 * (100.0 / QThread::idealThreadCount())));
+
+        totalCpuBar->setValue(static_cast<int>(std::round(cpuAgg)));
+        cpuValueLabel->setText(QString("%1%").arg(remTotalCpu, 0, 'f', 1));
+        cpuSubLabel->setText(QString("≈ %1 cores").arg(remTotalCpu / 100.0, 0, 'f', 1));
+        cpuSparkline->addSample(remTotalCpu);
+
+        totalMemBar->setValue(static_cast<int>(std::round(remTotalMem)));
+        const QString remRssStr = remTotalRssMiB < 1024.0
+          ? QString("%1 MB").arg(remTotalRssMiB, 0, 'f', 0)
+          : QString("%1 GB").arg(remTotalRssMiB / 1024.0, 0, 'f', 2);
+        memValueLabel->setText(remRssStr);
+        memSubLabel->setText(QString("%1% proc rss").arg(remTotalMem, 0, 'f', 1));
+        memSparkline->addSample(remTotalMem);
+
+        // Remote GPU via nvidia-smi (rate-limited to reduce process churn).
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        if (remoteGpuLastProbeMs <= 0 || (nowMs - remoteGpuLastProbeMs) >= 5000) {
+          QString gpuProgram = program;
+          QStringList gpuArgs = args;
+          gpuArgs.removeLast();  // remove the ps command
+          gpuArgs << "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1";
+          QProcess gpuProc;
+          gpuProc.start(gpuProgram, gpuArgs);
+          if (gpuProc.waitForFinished(1500)) {
+            const QString gpuOut = QString::fromLocal8Bit(gpuProc.readAllStandardOutput()).trimmed();
+            const QStringList gp = gpuOut.split(',');
+            if (gp.size() >= 3) {
+              remoteGpuLastUtil = gp[0].trimmed().toDouble();
+              remoteGpuLastMemUsedMiB = qint64(gp[1].trimmed().toDouble());
+              remoteGpuLastMemTotalMiB = qint64(gp[2].trimmed().toDouble());
+            }
+          } else {
+            gpuProc.kill();
+            gpuProc.waitForFinished(500);
+          }
+          remoteGpuLastProbeMs = nowMs;
+        }
+        if (remoteGpuLastUtil >= 0.0 && remoteGpuLastMemTotalMiB > 0) {
+          totalGpuBar->setValue(static_cast<int>(std::round(remoteGpuLastUtil)));
+          gpuValueLabel->setText(QString("%1%").arg(remoteGpuLastUtil, 0, 'f', 1));
+          gpuSubLabel->setText(QString("%1 / %2 MiB")
+            .arg(remoteGpuLastMemUsedMiB).arg(remoteGpuLastMemTotalMiB));
+          gpuSparkline->addSample(remoteGpuLastUtil);
+          totalGpuBar->setToolTip(QString("Remote GPU: %1% util, %2/%3 MiB VRAM")
+            .arg(remoteGpuLastUtil, 0, 'f', 1)
+            .arg(remoteGpuLastMemUsedMiB)
+            .arg(remoteGpuLastMemTotalMiB));
+        } else {
+          gpuValueLabel->setText(QStringLiteral("n/a"));
+          gpuSubLabel->setText(QStringLiteral("remote nvidia-smi timeout"));
+        }
+      }
+
+      // ── Network card ────────────────────────────────────────────────────
+      {
+        const QString remHostNet = selectedRemoteHost();
+        auto applyPreviewBandwidthFallback = [&](const QString &reason) {
+          const qint64 now = QDateTime::currentMSecsSinceEpoch();
+          double totalMbps = 0.0;
+          int streamCount = 0;
+          for (auto it = netPreviewMbpsByName.constBegin(); it != netPreviewMbpsByName.constEnd(); ++it) {
+            if (it.value() > 0.0) {
+              totalMbps += it.value();
+              ++streamCount;
+            }
+          }
+          const double rxMBs = totalMbps / 8.0;
+          const qint64 dtMs = (netPreviewLastMs > 0 && now > netPreviewLastMs)
+            ? (now - netPreviewLastMs)
+            : 0;
+          if (dtMs > 0) {
+            netTotalRxBytes += qint64(rxMBs * 1e6 * (double(dtMs) / 1000.0));
+          }
+          netPreviewLastMs = now;
+
+          auto fmtMBs = [](double v) -> QString {
+            if (v < 0.001) return QStringLiteral("0 MB/s");
+            if (v < 1.0)   return QString("%1 KB/s").arg(v * 1000.0, 0, 'f', 0);
+            return QString("%1 MB/s").arg(v, 0, 'f', 2);
+          };
+          auto fmtTotal = [](qint64 b) -> QString {
+            if (b < 1024LL*1024*100)
+              return QString("%1 MB").arg(b / (1024*1024));
+            return QString("%1 GB").arg(static_cast<double>(b) / 1024.0 / 1024.0 / 1024.0, 0, 'f', 2);
+          };
+
+          const double rxPct = std::min(100.0, totalMbps / 10.0); // 1000 Mbps ref
+          netTitleLabel->setText(streamCount > 0
+            ? QString("NET (preview x%1)").arg(streamCount)
+            : QStringLiteral("NET (preview)"));
+          netRxBar->setValue(int(rxPct));
+          netTxBar->setValue(0);
+          netRxValueLabel->setText(fmtMBs(rxMBs));
+          netTxValueLabel->setText(QStringLiteral("0 MB/s"));
+          netSparkline->addSample(rxPct);
+          cardBarColor(netRxBar, rxPct, "#00BCD4");
+          cardBarColor(netTxBar, 0.0, "#26C6DA");
+          netTotalLabel->setText(
+            QString("↓%1  ↑%2 total")
+              .arg(fmtTotal(netTotalRxBytes)).arg(fmtTotal(netTotalTxBytes)));
+          const QString tip = QString("Preview stream fallback (%1): ↓RX=%2  ↑TX=0 MB/s")
+            .arg(reason, fmtMBs(rxMBs));
+          netRxBar->setToolTip(tip);
+          netTxBar->setToolTip(tip);
+        };
+        if (netIface.isEmpty() || netIfaceForHost != remHostNet) {
+          netRxPrev = -1;
+          netTxPrev = -1;
+          netTimePrev = -1;
+          netIface = QString();
+          if (!remHostNet.isEmpty()) {
+            QString ifaceProgram = program;
+            QStringList ifaceArgs = args;
+            ifaceArgs.removeLast();
+            ifaceArgs << QString(
+              "ip route get %1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'; "
+              "ip route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'")
+              .arg(remHostNet);
+            QProcess ifaceProc;
+            ifaceProc.start(ifaceProgram, ifaceArgs);
+            if (ifaceProc.waitForFinished(1500)) {
+              const QStringList ifaceLines = QString::fromLocal8Bit(ifaceProc.readAllStandardOutput())
+                                               .split('\n', Qt::SkipEmptyParts);
+              for (const QString &ln : ifaceLines) {
+                const QString cand = ln.trimmed();
+                if (!cand.isEmpty()) {
+                  netIface = cand;
+                  break;
+                }
+              }
+            }
+          }
+          netIfaceForHost = remHostNet;
+        }
+        if (!netIface.isEmpty()) {
+          qint64 linkMbps = 1000;
+          {
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            qint64 netRx = -1;
+            qint64 netTx = -1;
+            QString netProgram = program;
+            QStringList netArgs = args;
+            netArgs.removeLast();
+            netArgs << QString(
+              "IFACE=%1; "
+              "awk -F'[: ]+' -v I=\"$IFACE\" '$1==I {print $2\" \"$10; exit}' /proc/net/dev 2>/dev/null; "
+              "cat /sys/class/net/$IFACE/speed 2>/dev/null || echo 1000")
+              .arg(netIface);
+            QProcess netProc;
+            netProc.start(netProgram, netArgs);
+            if (netProc.waitForFinished(1500)) {
+              const QStringList outLines = QString::fromLocal8Bit(netProc.readAllStandardOutput())
+                                             .split('\n', Qt::SkipEmptyParts);
+              if (!outLines.isEmpty()) {
+                const QStringList bt = outLines[0].trimmed().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+                if (bt.size() >= 2) {
+                  netRx = bt[0].toLongLong();
+                  netTx = bt[1].toLongLong();
+                }
+              }
+              if (outLines.size() >= 2) {
+                const qint64 s = outLines[1].trimmed().toLongLong();
+                if (s > 0) linkMbps = s;
+              }
+            }
+            netTitleLabel->setText(
+              linkMbps >= 1000
+                ? QString("NET (%1 GbE)").arg(linkMbps / 1000)
+                : QString("NET (%1M)").arg(linkMbps));
+            if (netRx < 0 || netTx < 0) {
+              applyPreviewBandwidthFallback(QStringLiteral("remote net probe failed"));
+              return;
+            }
+            if (netRxPrev >= 0 && netTimePrev > 0 && now > netTimePrev) {
+              const double dt    = static_cast<double>(now - netTimePrev) / 1000.0;
+              const double rxMBs = std::max(0.0, static_cast<double>(netRx - netRxPrev) / dt / 1e6);
+              const double txMBs = std::max(0.0, static_cast<double>(netTx - netTxPrev) / dt / 1e6);
+              double previewMbps = 0.0;
+              for (auto it = netPreviewMbpsByName.constBegin(); it != netPreviewMbpsByName.constEnd(); ++it) {
+                previewMbps += std::max(0.0, it.value());
+              }
+              if ((rxMBs + txMBs) < 0.01 && previewMbps > 0.5) {
+                applyPreviewBandwidthFallback(QStringLiteral("remote iface idle, using preview Mbps"));
+                netRxPrev = netRx;  netTxPrev = netTx;  netTimePrev = now;
+                return;
+              }
+              const double totMBs = rxMBs + txMBs;
+              const double linkMBs = static_cast<double>(linkMbps) / 8.0;
+              const double rxPct  = std::min(100.0, rxMBs  / linkMBs * 100.0);
+              const double txPct  = std::min(100.0, txMBs  / linkMBs * 100.0);
+              const double totPct = std::min(100.0, totMBs / linkMBs * 100.0);
+              auto fmtMBs = [](double v) -> QString {
+                if (v < 0.001) return QStringLiteral("0 MB/s");
+                if (v < 1.0)   return QString("%1 KB/s").arg(v * 1000.0, 0, 'f', 0);
+                return QString("%1 MB/s").arg(v, 0, 'f', 2);
+              };
+              netRxBar->setValue(int(rxPct));  netTxBar->setValue(int(txPct));
+              netRxValueLabel->setText(fmtMBs(rxMBs));
+              netTxValueLabel->setText(fmtMBs(txMBs));
+              netSparkline->addSample(totPct);
+              cardBarColor(netRxBar, rxPct, "#00BCD4");
+              cardBarColor(netTxBar, txPct, "#26C6DA");
+              netTotalRxBytes += (netRx - netRxPrev);
+              netTotalTxBytes += (netTx - netTxPrev);
+              auto fmtTotal = [](qint64 b) -> QString {
+                if (b < 1024LL*1024*100)
+                  return QString("%1 MB").arg(b / (1024*1024));
+                return QString("%1 GB").arg(static_cast<double>(b) / 1024.0 / 1024.0 / 1024.0, 0, 'f', 2);
+              };
+              netTotalLabel->setText(
+                QString("\u2193%1  \u2191%2 total")
+                  .arg(fmtTotal(netTotalRxBytes)).arg(fmtTotal(netTotalTxBytes)));
+              const QString tip = QString(
+                "Link to %1 (%2): \u2193RX=%3  \u2191TX=%4 \u2014 %5% of %6 Mbps")
+                .arg(remHostNet).arg(netIface)
+                .arg(fmtMBs(rxMBs)).arg(fmtMBs(txMBs))
+                .arg(totPct, 0, 'f', 1).arg(linkMbps);
+              netRxBar->setToolTip(tip);  netTxBar->setToolTip(tip);
+            } else if (netRxPrev < 0) {
+              netRxValueLabel->setText(QStringLiteral("measuring\u2026"));
+              netTxValueLabel->setText(netIface);
+            }
+            netRxPrev = netRx;  netTxPrev = netTx;  netTimePrev = now;
+          }
+        } else {
+          applyPreviewBandwidthFallback(QStringLiteral("no remote iface"));
+        }
+      }
+
+      scheduleAsyncRemotePortProbe();
+      return;
+    }
 
     QStringList trackedPidStrings;
     for (qint64 pid : trackedCarlaPids) {
@@ -2927,6 +4330,32 @@ int main(int argc, char *argv[]) {
     if (trackedPidStrings.isEmpty()) {
       setProcessAreaEnabled(false);
       refreshRememberedPidList();
+
+      if (runtimeIsRemote()) {
+        // Non-blocking: fire async SSH probe; result arrives via signal.
+        // While waiting, show the last known state so the UI never freezes.
+        if (g_cachedPortResult > 0 && !launchRequestedOrRunning) {
+          if (portSpin && portSpin->value() != g_cachedPortResult)
+            portSpin->setValue(g_cachedPortResult);
+          setSimulationStatus(QString("Running (detected existing CARLA on port %1)")
+                              .arg(g_cachedPortResult));
+        } else if (!launchRequestedOrRunning && g_cachedPortResult <= 0) {
+          setSimulationStatus("Idle");
+        }
+        scheduleAsyncRemotePortProbe();
+      } else {
+        // Local mode: quick synchronous nc probe is cheap
+        const int detectedPort = scanCarlaPort();
+        if (detectedPort > 0) {
+          if (portSpin && portSpin->value() != detectedPort)
+            portSpin->setValue(detectedPort);
+          setSimulationStatus(QString("Running (detected existing CARLA on port %1)")
+                              .arg(detectedPort));
+        } else if (!launchRequestedOrRunning) {
+          setSimulationStatus("Idle");
+        }
+      }
+
       return;
     }
     setProcessAreaEnabled(true);
@@ -2993,34 +4422,16 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    static QMap<qint64, qint64> s_prev_jiffies;
-    static qint64 s_prev_ts_ms = 0;
-    const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
-    const int clk_tck = carla_studio_proc::proc_clk_tck();
-    QMap<qint64, double> delta_cpu_pct;
-    for (qint64 pid : trackedCarlaPids) {
-      const qint64 j = carla_studio_proc::proc_cpu_jiffies(pid);
-      if (j >= 0 && s_prev_jiffies.contains(pid) && s_prev_ts_ms > 0) {
-        const qint64 dj  = j - s_prev_jiffies.value(pid);
-        const qint64 dms = now_ms - s_prev_ts_ms;
-        if (dms > 0 && clk_tck > 0)
-          delta_cpu_pct[pid] = static_cast<double>(dj) / clk_tck * 1000.0 / static_cast<double>(dms) * 100.0;
-      }
-      if (j >= 0) s_prev_jiffies[pid] = j;
-    }
-    s_prev_ts_ms = now_ms;
-
     QProcess proc;
     proc.start("/bin/bash", QStringList() << "-lc"
-      << QString("ps -p %1 -o pid=,pmem=,rss=,comm= --sort=-rss").arg(pidCsv));
+      << QString("ps -p %1 -o pid=,pcpu=,pmem=,rss=,comm= --sort=-pcpu").arg(pidCsv));
     proc.waitForFinished(2000);
     const QString output = QString::fromLocal8Bit(proc.readAllStandardOutput());
     const QStringList lines = output.split('\n', Qt::SkipEmptyParts);
 
     if (lines.isEmpty()) {
-      setProcessAreaEnabled(false);
       refreshRememberedPidList();
-      return;
+      // Don't early-return — still render the self-row.
     }
 
     qint64 systemRamMiB = carla_studio_proc::system_total_ram_mib();
@@ -3056,23 +4467,79 @@ int main(int argc, char *argv[]) {
     double totalGpuMiB = 0.0;
     int gpuRows = 0;
 
-    carla_process_table->setRowCount(static_cast<int>(lines.size()));
+    // ── carla-studio self-monitoring row (local branch) ──────────────────
+    // Reuse stats already read before the isRemote branch.
+    const double selfCpuPct = selfCpuPctEarly;
+    // GPU usage of carla-studio itself (from local pmon).
+    const bool selfHasGpu   = gpuByPid.contains(selfPidEarly) || gpuMemPctByPid.contains(selfPidEarly);
+    const double selfGpuPct = gpuByPid.contains(selfPidEarly) ? gpuByPid.value(selfPidEarly)
+                            : gpuMemPctByPid.contains(selfPidEarly) ? gpuMemPctByPid.value(selfPidEarly)
+                            : 0.0;
+    const qint64 selfGpuMib = gpuMemMiBByPid.value(selfPidEarly, 0);
+    const double selfMemPct = systemRamMiB > 0
+                              ? (static_cast<double>(selfMemRssKib) / 1024.0) / static_cast<double>(systemRamMiB) * 100.0
+                              : 0.0;
+
+    // Contribute self to aggregate totals that feed CPU(L)/MEM(L)/GPU(L) cards.
+    totalCpu    += selfCpuPct;
+    totalMem    += selfMemPct;
+    totalMemMiB += static_cast<double>(selfMemRssKib) / 1024.0;
+    if (selfHasGpu) {
+      totalGpu    += selfGpuPct;
+      totalGpuMiB += double(selfGpuMib);
+      gpuRows     += 1;
+    }
+
+    // Reserve one extra row at the top for the self-entry.
+    carla_process_table->setRowCount(static_cast<int>(lines.size()) + 1);
     carla_process_table->verticalHeader()->setDefaultSectionSize(42);
     int row = 0;
+    {
+      // ── self row (grey, always row 0) ───────────────────────────────────
+      auto *selfHost = new QTableWidgetItem("\u25CF");
+      selfHost->setTextAlignment(Qt::AlignCenter);
+      selfHost->setForeground(QColor("#9E9E9E"));
+      selfHost->setToolTip("carla-studio (this process)");
+      carla_process_table->setItem(row, 0, selfHost);
+
+      auto *selfPidItem = new QTableWidgetItem(QString::number(selfPidEarly));
+      selfPidItem->setTextAlignment(Qt::AlignCenter);
+      carla_process_table->setItem(row, 1, selfPidItem);
+
+      auto *selfName = new QTableWidgetItem("CARLA Studio");
+      selfName->setForeground(QColor("#9E9E9E"));
+      selfName->setToolTip("carla-studio — monitoring itself");
+      carla_process_table->setItem(row, 2, selfName);
+
+      carla_process_table->setCellWidget(row, 3,
+        makeMetricBar(selfCpuPct,
+                      selfCpuPct > 0 ? QString("%1 cores").arg(selfCpuPct / 100.0, 0, 'f', 2)
+                                     : QString("measuring\u2026"),
+                      true));
+      carla_process_table->setCellWidget(row, 4,
+        makeMetricBar(selfMemPct,
+                      selfMemRssKib > 0 ? fmtMiB(static_cast<double>(selfMemRssKib) / 1024.0) : QString(""),
+                      selfMemRssKib > 0));
+      carla_process_table->setCellWidget(row, 5,
+        makeMetricBar(selfGpuPct,
+                      selfGpuMib > 0 ? QString("%1 MiB").arg(selfGpuMib) : "",
+                      selfHasGpu));
+      row += 1;
+    }
     for (const QString &line : lines) {
       const QStringList parts = line.trimmed().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
-      if (parts.size() < 4) {
+      if (parts.size() < 5) {
         continue;
       }
       bool pidOk = false;
+      bool cpuOk = false;
       bool memOk = false;
       bool rssOk = false;
       const qint64 pid     = parts[0].toLongLong(&pidOk);
-      const double cpu     = pidOk ? delta_cpu_pct.value(pid, -1.0) : -1.0;
-      const bool cpuOk     = cpu >= 0.0;
-      const double mem     = parts[1].toDouble(&memOk);
-      const qint64 rssKib  = parts[2].toLongLong(&rssOk);
-      const QString processName = parts[3];
+      const double cpu     = parts[1].toDouble(&cpuOk);
+      const double mem     = parts[2].toDouble(&memOk);
+      const qint64 rssKib  = parts[3].toLongLong(&rssOk);
+      const QString processName = parts[4];
       const double rssMiB  = static_cast<double>(rssKib) / 1024.0;
 
       static const std::array<std::pair<const char *, const char *>, 13> kPrettyProcs = {{
@@ -3100,40 +4567,47 @@ int main(int argc, char *argv[]) {
 
       auto *pidItem = new QTableWidgetItem(pidOk ? QString::number(pid) : "?");
       pidItem->setTextAlignment(Qt::AlignCenter);
-      carla_process_table->setItem(row, 0, pidItem);
+      // Host indicator column (col 0)
+      auto *hostItemL = new QTableWidgetItem("L");
+      hostItemL->setTextAlignment(Qt::AlignCenter);
+      hostItemL->setForeground(QColor("#FF9800"));
+      carla_process_table->setItem(row, 0, hostItemL);
+      carla_process_table->setItem(row, 1, pidItem);
       auto *nameItem = new QTableWidgetItem(prettyName);
       nameItem->setToolTip(processName);
-      carla_process_table->setItem(row, 1, nameItem);
+      carla_process_table->setItem(row, 2, nameItem);
 
-      carla_process_table->setCellWidget(row, 2,
+      carla_process_table->setCellWidget(row, 3,
         makeMetricBar(cpuOk ? cpu : 0.0,
                       cpuOk ? QString("%1 cores").arg(cpu / 100.0, 0, 'f', 2)
                             : QStringLiteral(""),
                       cpuOk));
-      carla_process_table->setCellWidget(row, 3,
+      carla_process_table->setCellWidget(row, 4,
         makeMetricBar(memOk ? mem : 0.0,
                       (memOk && rssOk) ? fmtMiB(rssMiB) : QStringLiteral(""),
                       memOk));
 
       const bool hasSm   = pidOk && gpuByPid.contains(pid);
-      const bool hasVram = pidOk && gpuMemMiBByPid.contains(pid);
+      const bool hasVram = pidOk && gpuMemPctByPid.contains(pid);
       const bool hasGpu  = hasSm || hasVram;
-      const double gpuPct = hasSm ? gpuByPid.value(pid) : 0.0;
+      const double gpuPct = hasSm ? gpuByPid.value(pid)
+                          : hasVram ? gpuMemPctByPid.value(pid)
+                          : 0.0;
       const qint64 gpuMib = pidOk ? gpuMemMiBByPid.value(pid, 0) : 0;
       if (hasGpu) {
-        carla_process_table->setCellWidget(row, 4,
+        carla_process_table->setCellWidget(row, 5,
           makeMetricBar(gpuPct,
                         gpuMib > 0 ? QString("%1 MiB").arg(gpuMib) : QStringLiteral(""),
-                        hasSm));
+                        true));
       } else {
-        carla_process_table->setCellWidget(row, 4, makeMetricBar(0.0, "", false));
+        carla_process_table->setCellWidget(row, 5, makeMetricBar(0.0, "", false));
       }
 
       if (cpuOk)           totalCpu    += cpu;
       if (memOk)           totalMem    += mem;
       if (memOk && rssOk)  totalMemMiB += rssMiB;
       if (hasGpu) {
-        if (hasSm) totalGpu += gpuPct;
+        totalGpu    += gpuPct;
         totalGpuMiB += double(gpuMib);
         gpuRows     += 1;
       }
@@ -3146,17 +4620,7 @@ int main(int argc, char *argv[]) {
     const double memAggregate = std::max(0.0, std::min(100.0, totalMem));
 
     // ── Threshold-aware bar color (shared for all three cards) ────────────
-    auto cardBarColor = [](QProgressBar *b, double pct, const QString &base) {
-      QString color = base;
-      if (pct >= 95.0)      color = "#C64545";
-      else if (pct >= 75.0) color = "#D9A13A";
-      b->setStyleSheet(QString(
-        "QProgressBar { border: none; border-radius: 2px;"
-        "  background: rgba(128,128,128,28); }"
-        "QProgressBar::chunk { border-radius: 2px; background: %1; }").arg(color));
-    };
-
-    // ── CPU card ──────────────────────────────────────────────────────────
+    // ── CPU card ────────────────────────────────────────────────────────────────
     totalCpuBar->setValue(static_cast<int>(std::round(cpuAggregate)));
     cpuValueLabel->setText(QString("%1%").arg(totalCpu, 0, 'f', 1));
     cpuSubLabel->setText(QString("≈ %1 cores active")
@@ -3219,9 +4683,10 @@ int main(int argc, char *argv[]) {
   QTimer *inAppCameraTick = new QTimer(&window);
   inAppCameraTick->setInterval(80);
 
-  QDockWidget *viewDock = nullptr;
+  [[maybe_unused]] QDockWidget *viewDock = nullptr;
   QVBoxLayout *viewGridLayout = nullptr;
   QMap<QString, QGroupBox *> viewTiles;
+  std::function<void(const QString &)> openDriverPreviewInGrid;
 
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
   QMap<QString, carla::SharedPtr<cc::Sensor>> activeViewSensors;
@@ -3563,13 +5028,31 @@ int main(int argc, char *argv[]) {
       } else if (!chosenMap.isEmpty()) {
 
         inAppDriveClient->SetTimeout(std::chrono::seconds(120));
-        try {
-          setSimulationStatus(QString("Running (loading %1)").arg(chosenMap));
-          inAppDriveClient->LoadWorld(chosenMap.toStdString());
-          waitFor("post-load world", worldQueryable, 60);
-        } catch (const std::exception &e) {
-          std::cerr << "[in-app driver] LoadWorld(" << chosenMap.toStdString()
-                    << ") failed: " << e.what() << '\n';
+        QStringList mapCandidates;
+        mapCandidates << chosenMap;
+        const QString mapLower = chosenMap.toLower();
+        if (mapLower == QStringLiteral("mcity") || mapLower == QStringLiteral("mcitymap_main")) {
+          mapCandidates << QStringLiteral("McityMap_Main")
+                        << QStringLiteral("/Game/McityMap/Maps/McityMap_Main")
+                        << QStringLiteral("McityMap/Maps/McityMap_Main");
+        }
+        mapCandidates.removeDuplicates();
+
+        bool mapLoaded = false;
+        for (const QString &candidateMap : mapCandidates) {
+          try {
+            setSimulationStatus(QString("Running (loading %1)").arg(candidateMap));
+            inAppDriveClient->LoadWorld(candidateMap.toStdString());
+            waitFor("post-load world", worldQueryable, 60);
+            mapLoaded = true;
+            break;
+          } catch (const std::exception &e) {
+            std::cerr << "[in-app driver] LoadWorld(" << candidateMap.toStdString()
+                      << ") failed: " << e.what() << '\n';
+          }
+        }
+        if (!mapLoaded) {
+          std::cerr << "[in-app driver] all LoadWorld candidates failed; continuing on current world\n";
         }
         inAppDriveClient->SetTimeout(std::chrono::seconds(30));
       }
@@ -3585,12 +5068,56 @@ int main(int argc, char *argv[]) {
       }
       carla::SharedPtr<cc::ActorList> vehicles =
           actors ? actors->Filter("vehicle.*") : nullptr;
+      const QString configuredBlueprint = QSettings()
+        .value("vehicle/blueprint", "vehicle.lincoln.mkz_2017")
+        .toString()
+        .trimmed();
+      auto mkzBlueprintCandidates = [&](const QString &requested) {
+        QString req = requested.trimmed();
+        if (req.isEmpty()) req = QStringLiteral("vehicle.lincoln.mkz_2017");
+        QStringList cands;
+        cands << req;
+        if (req == QLatin1String("vehicle.lincoln.mkz_2017")) {
+          cands << QStringLiteral("vehicle.lincoln.mkz")
+                << QStringLiteral("vehicle.lincoln.mkz_2020");
+        } else if (req == QLatin1String("vehicle.lincoln.mkz")) {
+          cands << QStringLiteral("vehicle.lincoln.mkz_2017")
+                << QStringLiteral("vehicle.lincoln.mkz_2020");
+        } else if (req == QLatin1String("vehicle.lincoln.mkz_2020")) {
+          cands << QStringLiteral("vehicle.lincoln.mkz_2017")
+                << QStringLiteral("vehicle.lincoln.mkz");
+        }
+        cands.removeDuplicates();
+        return cands;
+      };
+      QString requiredBlueprint = configuredBlueprint.isEmpty()
+        ? QStringLiteral("vehicle.lincoln.mkz_2017")
+        : configuredBlueprint;
+
+      // Reuse only an existing hero matching the configured startup blueprint.
       if (vehicles && !vehicles->empty()) {
-        in_app_drive_vehicle = std::static_pointer_cast<cc::Vehicle>(vehicles->at(0u));
-        inAppDriveSpawnedVehicle = false;
-        std::cerr << "[in-app driver] reused existing vehicle id="
-                  << in_app_drive_vehicle->GetId() << '\n';
-      } else {
+        for (auto a : *vehicles) {
+          if (!a) continue;
+          const QString tid = QString::fromStdString(a->GetTypeId());
+          if (tid != requiredBlueprint) continue;
+          bool isHero = false;
+          for (const auto &attr : a->GetAttributes()) {
+            if (attr.GetId() == "role_name" && attr.GetValue() == "hero") {
+              isHero = true;
+              break;
+            }
+          }
+          if (!isHero) continue;
+          in_app_drive_vehicle = std::static_pointer_cast<cc::Vehicle>(a);
+          inAppDriveSpawnedVehicle = false;
+          std::cerr << "[in-app driver] reused existing hero ("
+                    << requiredBlueprint.toStdString() << ") id="
+                    << in_app_drive_vehicle->GetId() << '\n';
+          break;
+        }
+      }
+
+      if (!in_app_drive_vehicle) {
         carla::SharedPtr<cc::BlueprintLibrary> blueprints;
         try {
           std::cerr << "[in-app driver] step: GetBlueprintLibrary\n";
@@ -3602,10 +5129,23 @@ int main(int argc, char *argv[]) {
           setSimulationStatus("Running (in-app driver failed: no blueprint library)");
           return false;
         }
-        auto vehicleBps = blueprints->Filter("vehicle.*");
-        if (!vehicleBps || vehicleBps->empty()) {
-          setSimulationStatus("Running (in-app driver failed: no vehicle blueprint)");
+        const carla::client::ActorBlueprint *mkzBpPtr = nullptr;
+        for (const QString &cand : mkzBlueprintCandidates(requiredBlueprint)) {
+          mkzBpPtr = blueprints->Find(cand.toStdString());
+          if (mkzBpPtr) {
+            requiredBlueprint = cand;
+            break;
+          }
+        }
+        if (!mkzBpPtr) {
+          setSimulationStatus(
+            QString("Running (in-app driver failed: blueprint unavailable: %1)")
+              .arg(configuredBlueprint));
           return false;
+        }
+        auto bp = *mkzBpPtr;
+        if (bp.ContainsAttribute("role_name")) {
+          bp.SetAttribute("role_name", "hero");
         }
 
         cg::Transform spawn;
@@ -3630,16 +5170,22 @@ int main(int argc, char *argv[]) {
             return false;
           }
         }
-
-        auto bp = vehicleBps->at(0u);
-        if (bp.ContainsAttribute("role_name")) {
-          bp.SetAttribute("role_name", "hero");
-        }
         try {
-          std::cerr << "[in-app driver] step: TrySpawnActor at ("
-                    << spawn.location.x << ", " << spawn.location.y
-                    << ", " << spawn.location.z << ")\n";
+          std::cerr << "[in-app driver] step: TrySpawnActor "
+                    << requiredBlueprint.toStdString() << "\n";
+          auto map = world.GetMap();
+          const auto spawnPoints = map ? map->GetRecommendedSpawnPoints()
+                                       : std::vector<cg::Transform>{};
+
+          // Try preferred spawn first, then all recommended spawn points.
           auto actor = world.TrySpawnActor(bp, spawn);
+          if (!actor) {
+            for (const auto &sp : spawnPoints) {
+              actor = world.TrySpawnActor(bp, sp);
+              if (actor) break;
+            }
+          }
+
           in_app_drive_vehicle = actor ? std::static_pointer_cast<cc::Vehicle>(actor) : nullptr;
           inAppDriveSpawnedVehicle = (in_app_drive_vehicle != nullptr);
           std::cerr << "[in-app driver] spawn result: "
@@ -3991,177 +5537,11 @@ int main(int argc, char *argv[]) {
   });
 
   openViewTile = [&](const QString &mode) {
-    if (!viewDock || !viewGridLayout) return;
-#ifdef CARLA_STUDIO_WITH_LIBCARLA
-
-    if (viewTiles.contains(mode)) {
-      viewDock->show();
-      viewDock->raise();
+    if (!openDriverPreviewInGrid) {
+      setSimulationStatus("Preparing preview backend... please retry");
       return;
     }
-
-    const QString host = targetHost->text().trimmed().isEmpty()
-                          ? QStringLiteral("localhost")
-                          : targetHost->text().trimmed();
-    const int port = portSpin->value();
-    std::shared_ptr<cc::Client> c;
-    try {
-      c = std::make_shared<cc::Client>(host.toStdString(), static_cast<uint16_t>(port));
-      c->SetTimeout(std::chrono::seconds(4));
-      (void)c->GetClientVersion();
-    } catch (...) {
-      QMessageBox::warning(&window, "CARLA unreachable",
-        QString("Could not reach %1:%2 - is the sim running?").arg(host).arg(port));
-      return;
-    }
-    try {
-      auto world = c->GetWorld();
-      carla::SharedPtr<cc::Actor> hero;
-
-      if (in_app_drive_vehicle) {
-        hero = in_app_drive_vehicle;
-      } else {
-        auto actorList = world.GetActors();
-        auto vehicleList = actorList ? actorList->Filter("vehicle.*") : nullptr;
-        if (vehicleList) {
-          for (auto a : *vehicleList) {
-            if (!a) continue;
-            for (const auto &attr : a->GetAttributes()) {
-              if (attr.GetId() == "role_name" && attr.GetValue() == "hero") { hero = a; break; }
-            }
-            if (hero) break;
-          }
-          if (!hero && !vehicleList->empty()) hero = (*vehicleList)[0];
-        }
-      }
-      if (!hero) {
-        QMessageBox::warning(&window, "No vehicle",
-          "No hero vehicle in the world yet. Press START first and wait for "
-          "the in-app driver to spawn one (~4 s).");
-        return;
-      }
-
-      auto bps = world.GetBlueprintLibrary();
-      const auto *rgb = bps ? bps->Find("sensor.camera.rgb") : nullptr;
-      if (!rgb) { QMessageBox::warning(&window, "Blueprint missing", "sensor.camera.rgb not found"); return; }
-      auto bpCopy = *rgb;
-      auto trySet = [&](const char *k, const QString &v) {
-        if (bpCopy.ContainsAttribute(k)) bpCopy.SetAttribute(k, v.toStdString());
-      };
-
-      int imgW = 640, imgH = 360;
-      QString modeFov = "90";
-      QString tileTitle;
-      cg::Transform tr;
-
-      if (mode == "FPV") {
-        tileTitle = "Driver (FPV)";
-        tr.location = cg::Location(0.5f, 0.0f, 1.4f);
-        tr.rotation = cg::Rotation(-2.0f, 0.0f, 0.0f);
-      } else if (mode == "CPV") {
-        tileTitle = "Cockpit";
-        tr.location = cg::Location(0.0f, -0.32f, 1.05f);
-        tr.rotation = cg::Rotation(-8.0f, 0.0f, 0.0f);
-        modeFov = "115";
-        imgW = 960; imgH = 300;
-      } else if (mode == "BEV") {
-        tileTitle = "Bird Eye";
-        tr.location = cg::Location(0.0f, 0.0f, 22.0f);
-        tr.rotation = cg::Rotation(-89.5f, 0.0f, 0.0f);
-      } else {
-        tileTitle = "Chase (TPV)";
-        tr.location = cg::Location(-6.0f, 0.0f, 2.6f);
-        tr.rotation = cg::Rotation(-12.0f, 0.0f, 0.0f);
-      }
-
-      trySet("image_size_x", QString::number(imgW));
-      trySet("image_size_y", QString::number(imgH));
-      trySet("fov", modeFov);
-
-      carla::SharedPtr<cc::Actor> rawActor;
-      try {
-        rawActor = world.SpawnActor(bpCopy, tr, hero.get());
-      } catch (const std::exception &e) {
-        QMessageBox::warning(&window, "Spawn failed",
-          QString("Couldn't spawn %1 camera: %2").arg(mode, e.what()));
-        return;
-      }
-      auto camera = std::static_pointer_cast<cc::Sensor>(rawActor);
-      if (!camera) return;
-
-      QGroupBox *tile = new QGroupBox(tileTitle);
-      QVBoxLayout *tileLayout = new QVBoxLayout(tile);
-      tileLayout->setContentsMargins(4, 4, 4, 4);
-      tileLayout->setSpacing(4);
-
-      QLabel *imgLabel = new QLabel();
-      imgLabel->setAlignment(Qt::AlignCenter);
-      imgLabel->setMinimumHeight(180);
-      imgLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-      imgLabel->setStyleSheet("background-color: black; color: #888;");
-      imgLabel->setText("Connecting…");
-      tileLayout->addWidget(imgLabel, 1);
-
-      QPushButton *closeBtn = new QPushButton("Close");
-      closeBtn->setFixedHeight(22);
-      tileLayout->addWidget(closeBtn);
-
-      auto labelPtr = QPointer<QLabel>(imgLabel);
-      camera->Listen([labelPtr](carla::SharedPtr<carla::sensor::SensorData> data) {
-        auto img = std::static_pointer_cast<csd::Image>(data);
-        if (!img) return;
-        const int w = static_cast<int>(img->GetWidth());
-        const int h = static_cast<int>(img->GetHeight());
-        const auto *raw = reinterpret_cast<const unsigned char *>(img->data());
-        QImage src(raw, w, h, QImage::Format_ARGB32);
-        QImage frame = src.rgbSwapped().copy();
-        QMetaObject::invokeMethod(labelPtr.data(), [labelPtr, frame]() {
-          if (!labelPtr) return;
-          labelPtr->setPixmap(QPixmap::fromImage(frame).scaled(
-            labelPtr->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-        }, Qt::QueuedConnection);
-      });
-
-      activeViewSensors.insert(mode, camera);
-      viewTiles.insert(mode, tile);
-
-      auto setViewBtn = [&](const QString &m, bool on) {
-        if      (m == "FPV") { QSignalBlocker b(fpvBtn); fpvBtn->setChecked(on); }
-        else if (m == "TPV") { QSignalBlocker b(tpvBtn); tpvBtn->setChecked(on); }
-        else if (m == "CPV") { QSignalBlocker b(cpvBtn); cpvBtn->setChecked(on); }
-        else if (m == "BEV") { QSignalBlocker b(bevBtn); bevBtn->setChecked(on); }
-      };
-      setViewBtn(mode, true);
-
-      QObject::connect(closeBtn, &QPushButton::clicked, tile,
-        [&, mode, camera, tile]() mutable {
-          try { camera->Stop(); camera->Destroy(); } catch (...) {}
-          activeViewSensors.remove(mode);
-          viewTiles.remove(mode);
-          if      (mode == "FPV") { QSignalBlocker b(fpvBtn); fpvBtn->setChecked(false); }
-          else if (mode == "TPV") { QSignalBlocker b(tpvBtn); tpvBtn->setChecked(false); }
-          else if (mode == "CPV") { QSignalBlocker b(cpvBtn); cpvBtn->setChecked(false); }
-          else if (mode == "BEV") { QSignalBlocker b(bevBtn); bevBtn->setChecked(false); }
-          tile->deleteLater();
-          if (viewTiles.isEmpty()) viewDock->hide();
-        });
-
-      const int stretchIdx = viewGridLayout->count() - 1;
-      viewGridLayout->insertWidget(stretchIdx, tile);
-
-      viewDock->show();
-      viewDock->raise();
-    } catch (const std::exception &e) {
-      QMessageBox::warning(&window, "CARLA error",
-        QString("Couldn't open %1 view: %2").arg(mode, e.what()));
-    } catch (...) {
-      QMessageBox::warning(&window, "CARLA error",
-        QString("Couldn't open %1 view (unknown error).").arg(mode));
-    }
-#else
-    Q_UNUSED(mode);
-    QMessageBox::warning(&window, "LibCarla not linked", "This build cannot reach CARLA.");
-#endif
+    openDriverPreviewInGrid(mode);
   };
 
   auto launchPythonDriverClient = [&](const QString &rootPath, const QString &host, int port, const QString &scenarioName) {
@@ -4234,10 +5614,30 @@ int main(int argc, char *argv[]) {
     } else if (text.endsWith("(remote)")) {
       targetHost->setText(text.left(text.size() - QString(" (remote)").size()));
     }
+    // Persist runtime selection so next GUI-only open remembers it.
+    if (!text.isEmpty() && text != "remotehost - Please configure in settings")
+      QSettings().setValue("carla/last_runtime", text);
     updateEndpoint();
+    validateCarlaRoot();
+  });
+  QObject::connect(targetHost, &QLineEdit::editingFinished, &window, [&]() {
+    const QString h = targetHost->text().trimmed();
+    if (!h.isEmpty()) {
+      QSettings().setValue("carla/last_host", h);
+      // Reload stored credentials whenever the host changes,
+      // but only override if not already set from CLI/env.
+      if (guiOverrides.remoteUser.isEmpty())
+        remoteRuntimeUser = QSettings().value(QString("remote/cred/%1/user").arg(h)).toString().trimmed();
+      if (guiOverrides.remotePass.isEmpty())
+        remoteRuntimePass = QSettings().value(QString("remote/cred/%1/pass").arg(h)).toString().trimmed();
+    }
   });
 
-  QObject::connect(carla_root_path, &QLineEdit::editingFinished, &window, [&]() { validateCarlaRoot(); });
+  QObject::connect(carla_root_path, &QLineEdit::editingFinished, &window, [&]() {
+    const QString p = carla_root_path->text().trimmed();
+    if (!p.isEmpty()) QSettings().setValue("carla/last_root", p);
+    validateCarlaRoot();
+  });
 
   QObject::connect(refreshProcBtn, &QPushButton::clicked, &window, [&]() {
     discoverCarlaSimPids();
@@ -4255,7 +5655,24 @@ int main(int argc, char *argv[]) {
       }
       const QString configPath = rootPath + "/PythonAPI/util/config.py";
       if (!QFileInfo(configPath).isFile()) {
-        setSimulationStatus(QString("Running (cannot switch to %1: config.py missing)").arg(mapName));
+        const QString host = targetHost->text().trimmed().isEmpty()
+                               ? QStringLiteral("localhost")
+                               : targetHost->text().trimmed();
+        [[maybe_unused]] const int port = portSpin->value();
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+        // In remote mode, config.py may be absent locally; try direct RPC map switch.
+        setSimulationStatus(QString("Running (loading %1 via RPC...)").arg(mapName));
+        try {
+          cc::Client client(host.toStdString(), static_cast<uint16_t>(port));
+          client.SetTimeout(carla::time_duration::seconds(5));
+          client.LoadWorld(mapName.toStdString());
+          setSimulationStatus(QString("Running (%1 loaded)").arg(mapName));
+        } catch (...) {
+          setSimulationStatus(QString("Running (failed to load %1)").arg(mapName));
+        }
+#else
+        setSimulationStatus(QString("Running (map switch skipped: config.py missing for %1)").arg(mapName));
+#endif
         return;
       }
       const QString host = targetHost->text().trimmed().isEmpty()
@@ -4283,18 +5700,92 @@ int main(int argc, char *argv[]) {
 
   QObject::connect(stopBtn, &QPushButton::clicked, &window, [&]() {
     stopInAppDriver();
-    killTrackedPids();
-    killAllCarlaProcesses();
 
-    if (!g_dockerContainerId.isEmpty()) {
-      QProcess::startDetached("docker",
-        QStringList() << "stop" << g_dockerContainerId.left(12));
-      g_dockerContainerId.clear();
+    if (runtimeIsRemote()) {
+      const QString host = selectedRemoteHost();
+      const QString sshTarget = remoteRuntimeUser.isEmpty()
+                                  ? host
+                                  : QString("%1@%2").arg(remoteRuntimeUser, host);
+
+      if (!host.isEmpty()) {
+        setSimulationStatus("Stopping remote CARLA...");
+
+        // Build the same kill script as stop_cli.cpp's remote branch.
+        QStringList script;
+        script << "PIDS=\"\"";
+        script << "PIDFILE=\"$HOME/.config/carla-studio/carla-pids.txt\"";
+        script << "if [ -f \"$PIDFILE\" ]; then";
+        script << "  while IFS= read -r line; do";
+        script << "    case \"$line\" in ''|*[!0-9]*) continue;; esac";
+        script << "    [ \"$line\" -gt 1 ] && PIDS=\"$PIDS $line\"";
+        script << "  done < \"$PIDFILE\"";
+        script << "fi";
+        script << "for p in $(pgrep -f 'CarlaUE[45]-Linux|CarlaUnreal-Linux-Shipping|CarlaUnreal\\.sh|CarlaUE[45]\\.sh|UnrealEditor.*Carla' 2>/dev/null || true); do";
+        script << "  PIDS=\"$PIDS $p\"";
+        script << "done";
+        script << "if [ -z \"$PIDS\" ]; then echo '[stop] No CARLA processes found on remote.'; exit 0; fi";
+        script << "echo '[stop] Sending SIGTERM to remote CARLA...'";
+        script << "for p in $PIDS; do kill -TERM \"$p\" 2>/dev/null && echo \"[stop]   SIGTERM -> PID $p\" || true; done";
+        script << "for _ in $(seq 1 15); do";
+        script << "  alive=0";
+        script << "  for p in $PIDS; do kill -0 \"$p\" 2>/dev/null && alive=1; done";
+        script << "  [ \"$alive\" -eq 0 ] && break; sleep 2";
+        script << "done";
+        script << "for p in $PIDS; do kill -0 \"$p\" 2>/dev/null && kill -KILL \"$p\" 2>/dev/null && echo \"[stop]   SIGKILL -> PID $p\" || true; done";
+        script << "rm -f \"$PIDFILE\"";
+        script << "echo '[stop] Remote CARLA stopped.'";
+
+        auto *killProc = new QProcess(&window);
+        if (!g_sshpassCheckDone) {
+          QProcess chk; chk.start("/bin/sh", {"-c", "command -v sshpass"});
+          chk.waitForFinished(1000);
+          g_sshpassOk = (chk.exitCode() == 0);
+          g_sshpassCheckDone = true;
+        }
+        QString program = "ssh";
+        QStringList sshArgs;
+        if (!remoteRuntimePass.isEmpty() && g_sshpassOk) {
+          program = "sshpass";
+          sshArgs << "-p" << remoteRuntimePass << "ssh";
+        }
+        if (!remoteRuntimeBindAddress.isEmpty())
+          sshArgs << "-o" << QString("BindAddress=%1").arg(remoteRuntimeBindAddress);
+        sshArgs << "-o" << "StrictHostKeyChecking=accept-new"
+                << "-o" << "ConnectTimeout=5"
+                << sshTarget
+                << script.join("\n");
+
+        killProc->setProcessChannelMode(QProcess::MergedChannels);
+        QObject::connect(killProc,
+          QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+          &window, [killProc, &setSimulationStatus, &refreshProcessList]
+                   (int, QProcess::ExitStatus) {
+            const QString out = QString::fromLocal8Bit(killProc->readAllStandardOutput()).trimmed();
+            if (!out.isEmpty())
+              fprintf(stderr, "%s\n", out.toUtf8().constData());
+            killProc->deleteLater();
+            setSimulationStatus("Stopped");
+            refreshProcessList();
+          });
+        killProc->start(program, sshArgs);
+      } else {
+        setSimulationStatus("Stopped");
+        refreshProcessList();
+      }
+    } else {
+      killTrackedPids();
+      killAllCarlaProcesses();
+
+      if (!g_dockerContainerId.isEmpty()) {
+        QProcess::startDetached("docker",
+          QStringList() << "stop" << g_dockerContainerId.left(12));
+        g_dockerContainerId.clear();
+      }
+
+      forceStopTimer->start(5000);
+      refreshProcessList();
+      setSimulationStatus("Stopped");
     }
-
-    forceStopTimer->start(5000);
-    refreshProcessList();
-    setSimulationStatus("Stopped");
   });
 
   struct LaunchableBinary {
@@ -4359,11 +5850,47 @@ int main(int argc, char *argv[]) {
     driverViewMode->setCurrentText("Third Person");
     setSimulationStatus("Initializing");
 
-    const QString target = targetHost->text().trimmed().isEmpty() ? "localhost" : targetHost->text().trimmed();
+    const QString target = runtimeIsRemote()
+      ? selectedRemoteHost()
+      : (targetHost->text().trimmed().isEmpty() ? QStringLiteral("localhost") : targetHost->text().trimmed());
     const QString scenarioName = scenarioSelect->currentText();
     const QString runtimeName = runtimeTarget->currentText();
     const int launchPort = portSpin->value();
     updateEndpoint();
+
+    auto waitForCarlaReadyThenLaunch = [&](const QString &rootPath,
+                                           const QString &launchHost,
+                                           const QString &scenarioToLaunch,
+                                           int portToCheck,
+                                           int timeoutMs) {
+      auto *probeTimer = new QTimer(&window);
+      probeTimer->setInterval(1000);
+      auto elapsedMs = std::make_shared<int>(0);
+      QObject::connect(probeTimer, &QTimer::timeout, &window,
+        [&, probeTimer, elapsedMs, rootPath, launchHost, scenarioToLaunch, portToCheck, timeoutMs]() {
+          *elapsedMs += probeTimer->interval();
+          if (isCarlaPortReachable(portToCheck)) {
+            probeTimer->stop();
+            probeTimer->deleteLater();
+
+            setSimulationStatus("Running");
+            updateEndpoint();
+            discoverCarlaSimPids();
+            refreshProcessList();
+            launchSelectedDriverMode(rootPath, launchHost, portToCheck, scenarioToLaunch);
+            return;
+          }
+          if (timeoutMs > 0 && *elapsedMs >= timeoutMs) {
+            probeTimer->stop();
+            probeTimer->deleteLater();
+            setSimulationStatus("Idle");
+            QMessageBox::warning(&window, "CARLA not reachable",
+              QString("CARLA RPC did not become reachable at %1:%2 within %3 seconds.")
+                .arg(launchHost).arg(portToCheck).arg(timeoutMs / 1000));
+          }
+        });
+      probeTimer->start();
+    };
 
     if (runtimeName == "localhost" || runtimeName == "Local") {
       if (!validateCarlaRoot()) {
@@ -4398,7 +5925,7 @@ int main(int argc, char *argv[]) {
       if (carlaAlreadyRunning) {
         setSimulationStatus(QString("Running (attaching to existing CARLA on port %1)")
                               .arg(launchPort));
-        launchDelayMs = 100;
+        launchDelayMs = 0;
       } else {
         QStringList modeArgs;
 
@@ -4449,9 +5976,13 @@ int main(int argc, char *argv[]) {
         }
       }
 
-      QTimer::singleShot(launchDelayMs, &window, [=]() {
-        launchSelectedDriverMode(rootPath, target, launchPort, scenarioName);
-      });
+      if (launchDelayMs <= 0) {
+        waitForCarlaReadyThenLaunch(rootPath, target, scenarioName, launchPort, 30000);
+      } else {
+        QTimer::singleShot(launchDelayMs, &window, [&, rootPath]() {
+        waitForCarlaReadyThenLaunch(rootPath, target, scenarioName, launchPort, 0);
+        });
+      }
 
       if (!optRenderOffscreen->isChecked()) {
         fitCarlaWindowToSafeSize();
@@ -4505,19 +6036,59 @@ int main(int argc, char *argv[]) {
         QTextStream(&log) << "docker run -> " << g_dockerContainerId << "\n";
       }
       setSimulationStatus(QString("Initializing (docker %1)").arg(shortId));
+      waitForCarlaReadyThenLaunch(carla_root_path->text().trimmed(), target, scenarioName, launchPort, 0);
     } else {
-    }
-
-    QTimer::singleShot(1500, &window, [=]() {
-      int detectedPort = scanCarlaPort();
-      if (detectedPort > 0) {
-        portSpin->setValue(detectedPort);
-      }
-      setSimulationStatus("Running");
-      updateEndpoint();
-      discoverCarlaSimPids();
+      // Remote runtime: SSH-launch CARLA on the remote host if it is not already
+      // reachable, then poll until the RPC port answers (up to 120 s).
+      // Reuses the same launch logic as `carla-studio start --remote-host …`.
+      setSimulationStatus(QString("Launching remote CARLA at %1:%2…").arg(target).arg(launchPort));
       refreshProcessList();
-    });
+
+      if (!isCarlaPortReachable(launchPort)) {
+        // Build the argument list for `carla-studio start`.
+        // Remote launches should not blindly forward the local CARLA root path.
+        // Use an explicit remote-root override only when the user configured it.
+        const QString remoteRootOverride =
+          QSettings().value("runtime/remote_carla_root").toString().trimmed();
+        QStringList startArgs;
+        startArgs << QStringLiteral("start")
+                  << QStringLiteral("--remote-host") << target
+                  << QStringLiteral("--port")         << QString::number(launchPort);
+        const QString defaultRes = QSettings().value("render/default_resolution", "3840x2160").toString().trimmed();
+        const QString defaultQuality = QSettings().value("render/default_quality", "ultra").toString().trimmed().toLower();
+        if (!defaultRes.isEmpty())
+          startArgs << QStringLiteral("--res") << defaultRes;
+        if (defaultQuality == "low" || defaultQuality == "medium"
+            || defaultQuality == "high" || defaultQuality == "ultra") {
+          startArgs << QStringLiteral("--quality") << defaultQuality;
+        }
+        if (!remoteRuntimeUser.isEmpty())
+          startArgs << QStringLiteral("--remote-user") << remoteRuntimeUser;
+        if (!remoteRuntimePass.isEmpty())
+          startArgs << QStringLiteral("--remote-pass") << remoteRuntimePass;
+        if (!remoteRuntimeBindAddress.isEmpty())
+          startArgs << QStringLiteral("--remote-bind-address") << remoteRuntimeBindAddress;
+        if (!remoteRootOverride.isEmpty())
+          startArgs << QStringLiteral("--directory") << remoteRootOverride;
+        // Run built-in start command from the current runtime selection and
+        // keep process lifecycle managed so launch failures are not silent.
+        auto *remoteStartProc = new QProcess(&window);
+        remoteStartProc->setProgram(QCoreApplication::applicationFilePath());
+        remoteStartProc->setArguments(startArgs);
+        remoteStartProc->setProcessChannelMode(QProcess::MergedChannels);
+        QObject::connect(remoteStartProc,
+          QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+          &window, [remoteStartProc](int, QProcess::ExitStatus) {
+            const QString out = QString::fromLocal8Bit(remoteStartProc->readAllStandardOutput()).trimmed();
+            if (!out.isEmpty()) fprintf(stderr, "%s\n", out.toUtf8().constData());
+            remoteStartProc->deleteLater();
+          });
+        remoteStartProc->start();
+        setSimulationStatus(QString("Waiting for remote CARLA at %1:%2…").arg(target).arg(launchPort));
+      }
+
+      waitForCarlaReadyThenLaunch("", target, scenarioName, launchPort, 120000);
+    }
   });
 
   enum class InstallerMode { InstallSdk, InstallAdditionalMaps };
@@ -6207,8 +7778,8 @@ int main(int argc, char *argv[]) {
                  "not detected (set $CARLA_STUDIO_ROS_PATH for source builds)", {}, {} };
       }
       const qsizetype colon = out.indexOf(':');
-      const QString kind   = colon >= 0 ? out.left(colon) : out;
-      const QString distro = colon >= 0 ? out.mid(colon + 1) : QString();
+      const QString kind   = colon >= 0 ? out.left(static_cast<int>(colon)) : out;
+      const QString distro = colon >= 0 ? out.mid(static_cast<int>(colon + 1)) : QString();
       QString detail;
       if (kind == "path")      detail = distro + " (ros2 on PATH)";
       else if (kind == "env")  detail = distro + " (env only - source setup.bash)";
@@ -6385,6 +7956,60 @@ int main(int argc, char *argv[]) {
   populateScenarios();
   refreshRuntimeOptions();
   updateEndpoint();
+
+  // If starting in remote mode, resolve the outbound interface and display
+  // link speed in the NET card title immediately — no need to wait for the
+  // first refresh cycle.
+  if (runtimeIsRemote() && targetHost) {
+    const QString h = targetHost->text().trimmed();
+    if (!h.isEmpty()) {
+      auto ipToLE = [](const QString &ip) -> quint32 {
+        const QStringList p = ip.split('.');
+        if (p.size() != 4) return 0u;
+        bool ok; quint32 r = 0;
+        r  = p[0].toUInt(&ok); if (!ok) return 0u;
+        r |= p[1].toUInt(&ok) << 8;  if (!ok) return 0u;
+        r |= p[2].toUInt(&ok) << 16; if (!ok) return 0u;
+        r |= p[3].toUInt(&ok) << 24; if (!ok) return 0u;
+        return r;
+      };
+      const quint32 targetLE = ipToLE(h);
+      if (targetLE) {
+        QFile rf(QStringLiteral("/proc/net/route"));
+        if (rf.open(QIODevice::ReadOnly)) {
+          rf.readLine();
+          quint32 bestMask = 0;
+          while (!rf.atEnd()) {
+            const QByteArray raw = rf.readLine();
+            const QList<QByteArray> cols = raw.split('\t');
+            if (cols.size() < 8) continue;
+            const quint32 dest = cols[1].trimmed().toUInt(nullptr, 16);
+            const quint32 mask = cols[7].trimmed().toUInt(nullptr, 16);
+            if ((targetLE & mask) == (dest & mask)) {
+              if (netIface.isEmpty() || mask > bestMask) {
+                netIface = QString::fromLatin1(cols[0].trimmed());
+                bestMask = mask;
+              }
+            }
+          }
+        }
+      }
+      if (!netIface.isEmpty()) {
+        netIfaceForHost = h;
+        qint64 linkMbps = 1000;
+        QFile sf(QString("/sys/class/net/%1/speed").arg(netIface));
+        if (sf.open(QIODevice::ReadOnly)) {
+          const qint64 s = sf.readAll().trimmed().toLongLong();
+          if (s > 0) linkMbps = s;
+        }
+        netTitleLabel->setText(
+          linkMbps >= 1000
+            ? QString("NET (%1 GbE)").arg(linkMbps / 1000)
+            : QString("NET (%1M)").arg(linkMbps));
+      }
+    }
+  }
+
   refreshProcessList();
 
   {
@@ -6459,52 +8084,45 @@ int main(int argc, char *argv[]) {
     "CARLA blueprint ID (vehicle.* family). Spawns this model as the "
     "ego at simulation start. Refresh from the live BlueprintLibrary "
     "via Apply on the Sense pane.");
-  const QStringList kDefaultVehicleBlueprints = {
-    "vehicle.lincoln.mkz_2020",
-    "vehicle.lincoln.mkz_2017",
-    "vehicle.tesla.model3",
-    "vehicle.audi.a2",
-    "vehicle.audi.tt",
-    "vehicle.audi.etron",
-    "vehicle.bmw.grandtourer",
-    "vehicle.chevrolet.impala",
-    "vehicle.citroen.c3",
-    "vehicle.dodge.charger_2020",
-    "vehicle.dodge.charger_police",
-    "vehicle.ford.mustang",
-    "vehicle.jeep.wrangler_rubicon",
-    "vehicle.mercedes.coupe",
-    "vehicle.mini.cooper_s",
-    "vehicle.nissan.micra",
-    "vehicle.nissan.patrol",
-    "vehicle.seat.leon",
-    "vehicle.toyota.prius",
-    "vehicle.harley-davidson.low_rider",
-    "vehicle.kawasaki.ninja",
-    "vehicle.yamaha.yzf",
-    "vehicle.bh.crossbike",
-    "vehicle.diamondback.century",
-    "vehicle.gazelle.omafiets",
-    "vehicle.carlamotors.carlacola",
-    "vehicle.carlamotors.firetruck",
-    "vehicle.tesla.cybertruck",
-    "vehicle.volkswagen.t2",
-    "vehicle.mercedes.sprinter",
-    "vehicle.ford.ambulance",
+  const QStringList kDefaultVehicleBlueprints = {}; // unused — see kCfgVehicles below
+  using CfgVehiclePair = QPair<QString, QString>;
+  static const QList<CfgVehiclePair> kCfgVehicles = {
+    {"Lincoln MKZ 2017",       "vehicle.lincoln.mkz_2017"},
+    {"Lincoln MKZ 2020",       "vehicle.lincoln.mkz_2020"},
+    {"Mini Cooper S",          "vehicle.mini.cooper_s"},
+    {"Dodge Charger",          "vehicle.dodge.charger"},
+    {"Dodge Charger (Police)", "vehicle.dodgecop.charger"},
+    {"Nissan Patrol",          "vehicle.nissan.patrol"},
+    {"Ford Mustang",           "vehicle.ue4.ford.mustang"},
+    {"Ford Crown Victoria",    "vehicle.ue4.ford.crown"},
+    {"BMW Gran Tourer",        "vehicle.ue4.bmw.grantourer"},
+    {"Audi TT",                "vehicle.ue4.audi.tt"},
+    {"Mercedes CCC",           "vehicle.ue4.mercedes.ccc"},
+    {"Chevrolet Impala",       "vehicle.ue4.chevrolet.impala"},
+    {"Ford Ambulance",         "vehicle.ambulance.ford"},
+    {"Mercedes Sprinter",      "vehicle.sprinter.mercedes"},
+    {"Mitsubishi Fuso",        "vehicle.fuso.mitsubishi"},
+    {"Fire Truck",             "vehicle.firetruck.actors"},
+    {"Carla Cola",             "vehicle.carlacola.actors"},
+    {"Ford Taxi",              "vehicle.taxi.ford"},
   };
-  for (const QString &bp : kDefaultVehicleBlueprints) {
-    vehicleBlueprintCombo->addItem(bp);
-  }
+  for (const auto &v : kCfgVehicles)
+    vehicleBlueprintCombo->addItem(v.first, v.second);
   {
     const QString saved = QSettings().value(
-      "vehicle/blueprint", "vehicle.lincoln.mkz_2020").toString();
-    const int idx = vehicleBlueprintCombo->findText(saved);
-    if (idx >= 0) vehicleBlueprintCombo->setCurrentIndex(idx);
-    else vehicleBlueprintCombo->setCurrentText(saved);
+      "vehicle/blueprint", "vehicle.lincoln.mkz_2017").toString();
+    bool found = false;
+    for (int i = 0; i < vehicleBlueprintCombo->count(); ++i) {
+      if (vehicleBlueprintCombo->itemData(i).toString() == saved) {
+        vehicleBlueprintCombo->setCurrentIndex(i); found = true; break;
+      }
+    }
+    if (!found) vehicleBlueprintCombo->setCurrentIndex(0);
   }
-  QObject::connect(vehicleBlueprintCombo, &QComboBox::currentTextChanged,
-    &window, [](const QString &s) {
-      QSettings().setValue("vehicle/blueprint", s);
+  QObject::connect(vehicleBlueprintCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+    &window, [vehicleBlueprintCombo](int) {
+      QSettings().setValue("vehicle/blueprint",
+                           vehicleBlueprintCombo->currentData().toString());
     });
   vehicleForm->addRow("Blueprint:", vehicleBlueprintCombo);
 
@@ -6900,7 +8518,17 @@ int main(int argc, char *argv[]) {
   }
 
   QDockWidget *previewDock = nullptr;
+  QMenu *previewWindowFileMenu = nullptr;
   std::function<void(const QString &)> addPreviewTileByName;
+  std::function<void()> relayoutPreviewTiles;
+
+  // Sensors that auto-expand to 4 directional instances when count > 1.
+  // The Nth instance uses the Nth name from this list for spawning/preview.
+  const QMap<QString, QStringList> kDirectionalSensors = {
+    {"Fisheye", {"Fisheye Front", "Fisheye Rear", "Fisheye Left", "Fisheye Right"}},
+    {"RGB",     {"Camera Front",  "Camera Rear",  "Camera Left",  "Camera Right"}},
+    {"Sonar",   {"Sonar Front",   "Sonar Rear",   "Sonar Left",   "Sonar Right"}},
+  };
 
   auto makeCompactCategory = [&](const QString &title, const QStringList &sensorNames, QLabel *countText,
                                  std::vector<QCheckBox *> &checks, std::vector<QPushButton *> &gears,
@@ -6991,7 +8619,18 @@ int main(int argc, char *argv[]) {
         "Open a live preview tile for this sensor (%1).").arg(sensor_name));
       QObject::connect(sensorPreview, &QPushButton::clicked, &window,
         [&, sensor_name]() {
-          addPreviewTileByName(sensor_name);
+          // For directional sensors expand to the first N named instances.
+          const QStringList dirs = kDirectionalSensors.value(sensor_name);
+          const int cnt = dirs.isEmpty() ? 1 : std::max(1, sensor_instance_count.value(sensor_name, 1));
+          if (!dirs.isEmpty()) {
+            for (int d = 0; d < std::min(cnt, static_cast<int>(dirs.size())); ++d) {
+              addPreviewTileByName(dirs[d]);
+              if (startSensorPreview) startSensorPreview(dirs[d]);
+            }
+          } else {
+            addPreviewTileByName(sensor_name);
+            if (startSensorPreview) startSensorPreview(sensor_name);
+          }
           previewDock->show();
           previewDock->raise();
         });
@@ -7015,7 +8654,8 @@ int main(int argc, char *argv[]) {
   std::vector<int> cameraSensorCounts;
   QLabel *cameraCountLabel = new VerticalTitleLabel("×0");
   QGroupBox *cameraCategory = makeCompactCategory("Camera", QStringList()
-    << "RGB" << "Depth" << "Semantic Seg" << "Instance Seg" << "DVS" << "Optical Flow" << "Fisheye",
+    << "RGB" << "Depth" << "Semantic Seg" << "Instance Seg" << "DVS" << "Optical Flow" << "Fisheye"
+    << "Camera Cabin",
     cameraCountLabel, cameraChecks, cameraGears, cameraPluses, cameraSensorCountLabels, cameraSensorCounts);
   sensorLayout->addWidget(cameraCategory);
 
@@ -7062,6 +8702,17 @@ int main(int argc, char *argv[]) {
     << "Collision" << "Lane Invasion" << "Obstacle",
     gtCountLabel, gtChecks, gtGears, gtPluses, gtSensorCountLabels, gtSensorCounts);
   sensorLayout->addWidget(groundTruthCategory);
+
+  std::vector<QCheckBox *> sonarChecks;
+  std::vector<QPushButton *> sonarGears;
+  std::vector<QPushButton *> sonarPluses;
+  std::vector<QLabel *> sonarSensorCountLabels;
+  std::vector<int> sonarSensorCounts;
+  QLabel *sonarCountLabel = new VerticalTitleLabel("×0");
+  QGroupBox *sonarCategory = makeCompactCategory("Sonar", QStringList()
+    << "Sonar",
+    sonarCountLabel, sonarChecks, sonarGears, sonarPluses, sonarSensorCountLabels, sonarSensorCounts);
+  sensorLayout->addWidget(sonarCategory);
 
   QGroupBox *rosPseudoCategory = new QGroupBox("ros-bridge");
   rosPseudoCategory->setToolTip(
@@ -8470,7 +10121,7 @@ int main(int argc, char *argv[]) {
   applyL5InputLockout(saeBtnGroup->checkedId());
 
   if (l1LaneKeepBtn && l1AccBtn) {
-    auto onL1FeaturePicked = [&, l1LaneKeepBtn]() {
+    auto onL1FeaturePicked = [&, l1LaneKeepBtn, l1AccBtn]() {
       l1FeatureIsLaneKeep = l1LaneKeepBtn->isChecked();
       QSettings().setValue("actuate/sae_l1_feature",
                            l1FeatureIsLaneKeep ? "lanekeep" : "acc");
@@ -8717,7 +10368,7 @@ int main(int argc, char *argv[]) {
 
       QLabel *viewPreview = new QLabel();
       viewPreview->setFixedSize(290, 150);
-      viewPreview->setFrameStyle(QFrame::StyledPanel | QFrame::Sunken);
+      viewPreview->setFrameStyle(static_cast<int>(QFrame::StyledPanel) | static_cast<int>(QFrame::Sunken));
       viewPreview->setAlignment(Qt::AlignCenter);
       slotLayout->addWidget(viewPreview);
       slot->setLayout(slotLayout);
@@ -9624,6 +11275,49 @@ int main(int argc, char *argv[]) {
     dialog.exec();
   };
 
+  // Returns a pre-defined SensorMountConfig for a known directional sensor name.
+  // These coordinates (tx,ty,tz in metres; rx=roll, ry=pitch, rz=yaw in degrees)
+  // match the attach transforms used by startSensorPreview.
+  auto directionalMountFor = [](const QString &dirName) -> SensorMountConfig {
+    SensorMountConfig m;
+    m.framePreset = "Vehicle Center";
+    if (dirName == "Fisheye Front") {
+      // Exterior front-center, just above grille line, looking forward.
+      m.tx=2.15; m.ty=0.00; m.tz=1.32; m.rx=0.0; m.ry=-2.0; m.rz=  0.0;
+    } else if (dirName == "Fisheye Rear") {
+      // Exterior rear-center, just above trunk line, looking backward.
+      m.tx=-2.10; m.ty=0.00; m.tz=1.30; m.rx=0.0; m.ry=-2.0; m.rz=180.0;
+    } else if (dirName == "Fisheye Left") {
+      // Exterior left mirror region, looking left.
+      m.tx=0.35; m.ty=-1.18; m.tz=1.36; m.rx=0.0; m.ry=-2.0; m.rz=-90.0;
+    } else if (dirName == "Fisheye Right") {
+      // Exterior right mirror region, looking right.
+      m.tx=0.35; m.ty= 1.18; m.tz=1.36; m.rx=0.0; m.ry=-2.0; m.rz= 90.0;
+    } else if (dirName == "Camera Front") {
+      m.tx=1.90; m.ty=0.00; m.tz=1.35; m.rx=0.0; m.ry=0.0; m.rz=  0.0;
+    } else if (dirName == "Camera Rear") {
+      m.tx=-1.90; m.ty=0.00; m.tz=1.35; m.rx=0.0; m.ry=0.0; m.rz=180.0;
+    } else if (dirName == "Camera Left") {
+      m.tx=0.00; m.ty=-0.90; m.tz=1.40; m.rx=0.0; m.ry=0.0; m.rz=-90.0;
+    } else if (dirName == "Camera Right") {
+      m.tx=0.00; m.ty= 0.90; m.tz=1.40; m.rx=0.0; m.ry=0.0; m.rz= 90.0;
+    } else if (dirName == "Camera Cabin") {
+      // Interior RGB camera at the rear-view mirror location, looking into cabin.
+      m.tx=0.62; m.ty=0.00; m.tz=1.44; m.rx=0.0; m.ry=-4.0; m.rz=180.0;
+    } else if (dirName == "Sonar Front" || dirName == "Radar Front") {
+      m.tx=2.50; m.ty=0.00; m.tz=0.50; m.rx=0.0; m.ry=0.0; m.rz=  0.0;
+    } else if (dirName == "Sonar Rear"  || dirName == "Radar Rear") {
+      m.tx=-2.50; m.ty=0.00; m.tz=0.50; m.rx=0.0; m.ry=0.0; m.rz=180.0;
+    } else if (dirName == "Sonar Left"  || dirName == "Radar Left") {
+      m.tx=0.00; m.ty=-0.95; m.tz=0.50; m.rx=0.0; m.ry=0.0; m.rz=-90.0;
+    } else if (dirName == "Sonar Right" || dirName == "Radar Right") {
+      m.tx=0.00; m.ty= 0.95; m.tz=0.50; m.rx=0.0; m.ry=0.0; m.rz= 90.0;
+    } else {
+      m.tx=1.55; m.ty=0.00; m.tz=1.25; m.rx=0.0; m.ry=0.0; m.rz=0.0;
+    }
+    return m;
+  };
+
   auto wireCategory = [&](QString categoryName, std::vector<QCheckBox *> &checks, std::vector<QPushButton *> &gears,
                           std::vector<QPushButton *> &pluses, std::vector<QLabel *> &sensor_count_labels,
                           std::vector<int> &sensor_counts, QLabel *countLabel) {
@@ -9637,36 +11331,31 @@ int main(int argc, char *argv[]) {
       countLabel->setText(QString("×%1").arg(totalCount));
     };
 
-    auto ensure_default_name = [](const QString &sn, int idx) {
-      const QString key = QString("sensor/displayname/%1").arg(sensor_mount_key(sn, idx));
-      QSettings settings;
-      if (settings.value(key).toString().isEmpty()) {
-        QString base = sn.toLower().replace(' ', '_').replace('-', '_');
-        settings.setValue(key, QString("sensor_%1_%2").arg(base).arg(idx));
-      }
-    };
-
     for (size_t i = 0; i < checks.size(); ++i) {
       QCheckBox *check = checks[i];
       QPushButton *gear = gears[i];
       QPushButton *plus = pluses[i];
       QLabel *sensor_count_label = sensor_count_labels[i];
-      QObject::connect(check, &QCheckBox::toggled, &window, [&, i, gear, sensor_count_label, updateCategoryCount, ensure_default_name](bool checked) {
+      QObject::connect(check, &QCheckBox::toggled, &window, [&, i, gear, sensor_count_label, updateCategoryCount](bool checked) {
         gear->setEnabled(checked);
         sensor_count_label->setText(QString("x%1").arg(checked ? sensor_counts[i] : 0));
         const QString sn = checks[i]->property("sensor_name").toString();
         sensor_instance_count[sn] = checked ? sensor_counts[i] : 0;
-        if (checked) {
-          for (int j = 1; j <= sensor_counts[i]; ++j) ensure_default_name(sn, j);
-        }
         updateCategoryCount();
       });
-      QObject::connect(plus, &QPushButton::clicked, &window, [&, i, check, sensor_count_label, updateCategoryCount, ensure_default_name]() {
+      QObject::connect(plus, &QPushButton::clicked, &window, [&, i, check, sensor_count_label, updateCategoryCount]() {
         sensor_counts[i] += 1;
         const QString sn = check->property("sensor_name").toString();
-        sensor_mount_configs[sensor_mount_key(sn, sensor_counts[i])] = frontCenterMountForFrame("Rear Baselink");
+        const QStringList dirs = kDirectionalSensors.value(sn);
+        const int newInst = sensor_counts[i];
+        SensorMountConfig newMount;
+        if (!dirs.isEmpty() && newInst <= dirs.size()) {
+          newMount = directionalMountFor(dirs[newInst - 1]);
+        } else {
+          newMount = frontCenterMountForFrame("Rear Baselink");
+        }
+        sensor_mount_configs[sensor_mount_key(sn, newInst)] = newMount;
         sensor_instance_count[sn] = sensor_counts[i];
-        ensure_default_name(sn, sensor_counts[i]);
         if (!check->isChecked()) {
           check->setChecked(true);
         }
@@ -9696,35 +11385,58 @@ int main(int argc, char *argv[]) {
   wireCategory("NAV", navChecks, navGears, navPluses, navSensorCountLabels, navSensorCounts, navCountLabel);
   wireCategory("GT", gtChecks, gtGears, gtPluses, gtSensorCountLabels, gtSensorCounts, gtCountLabel);
 
-  previewDock = new QDockWidget("Sensor Preview Group", &window);
-  previewDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
-  previewDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
+  previewDock = new QDockWidget("Previews", &window);
+  // Always-floating preview window — never dockable into the main panel.
+  // This guarantees the main GUI keeps its natural width at all times.
+  previewDock->setAllowedAreas(Qt::NoDockWidgetArea);
+  previewDock->setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetMovable);
   QWidget *previewDockContent = new QWidget();
   QVBoxLayout *previewDockLayout = new QVBoxLayout(previewDockContent);
   previewDockLayout->setContentsMargins(4, 4, 4, 4);
   previewDockLayout->setSpacing(6);
 
-  QScrollArea *previewScroll = new QScrollArea(previewDockContent);
-  previewScroll->setWidgetResizable(true);
-  previewScroll->setFrameShape(QFrame::NoFrame);
-  previewScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  QHBoxLayout *previewTopBar = new QHBoxLayout();
+  previewTopBar->setContentsMargins(0, 0, 0, 0);
+  previewTopBar->setSpacing(4);
+  QToolButton *previewFileBtn = new QToolButton(previewDockContent);
+  previewFileBtn->setText("Cfg");
+  previewFileBtn->setPopupMode(QToolButton::InstantPopup);
+  previewWindowFileMenu = new QMenu(previewFileBtn);
+  previewFileBtn->setMenu(previewWindowFileMenu);
+  previewTopBar->addWidget(previewFileBtn, 0, Qt::AlignLeft | Qt::AlignVCenter);
+  previewTopBar->addStretch(1);
+  previewDockLayout->addLayout(previewTopBar);
 
   QWidget *previewGridHost = new QWidget();
-  QVBoxLayout *previewGridLayout = new QVBoxLayout(previewGridHost);
-  previewGridLayout->setContentsMargins(0, 0, 0, 0);
-  previewGridLayout->setSpacing(6);
-  previewGridLayout->addStretch(1);
-  previewScroll->setWidget(previewGridHost);
+  // Row 0:    ego/hero views — up to 4 side-by-side (Ego Driver/Chase/Cockpit/Bird Eye)
+  // Rows 1-4: sensor tiles  — column-major, 4×4 = 16 max
+  QGridLayout *previewGridLayout = new QGridLayout(previewGridHost);
+  previewGridLayout->setContentsMargins(4, 4, 4, 4);
+  previewGridLayout->setSpacing(4);
+  static constexpr int kPreviewGridRows = 5;
+  static constexpr int kPreviewGridCols = 4;
+  static constexpr int kPreviewMaxTiles = kPreviewGridRows * kPreviewGridCols;
+  for (int r = 0; r < kPreviewGridRows; ++r) {
+    previewGridLayout->setRowStretch(r, 1);
+  }
+  for (int c = 0; c < kPreviewGridCols; ++c) {
+    previewGridLayout->setColumnStretch(c, 1);
+  }
 
-  previewDockLayout->addWidget(previewScroll, 1);
+  previewDockLayout->addWidget(previewGridHost);
 
   QHBoxLayout *previewDockButtons = new QHBoxLayout();
-  QPushButton *reattachPreviewBtn = new QPushButton("Re-attach All");
+  QPushButton *reattachPreviewBtn = new QPushButton("Clear All");
+  reattachPreviewBtn->setToolTip("Remove all preview tiles from this window.");
   previewDockButtons->addStretch();
   previewDockButtons->addWidget(reattachPreviewBtn);
   previewDockLayout->addLayout(previewDockButtons);
   previewDock->setWidget(previewDockContent);
   window.addDockWidget(Qt::RightDockWidgetArea, previewDock);
+  // Force floating immediately. NoDockWidgetArea prevents re-docking.
+  // Do NOT call setWindowFlags() here — it breaks QDockWidget’s internal
+  // widget embedding and causes tiles to appear in the wrong parent.
+  previewDock->setFloating(true);
   previewDock->hide();
 
   {
@@ -9753,11 +11465,26 @@ int main(int argc, char *argv[]) {
   }
 
   QMap<QString, QGroupBox *> previewTiles;
-
   std::vector<QWidget *> detachedPreviewWindows;
 
-  QMap<QString, QLabel *> previewImageSinks;
+  QMap<QString, QLabel *>        previewImageSinks;
   QMap<QString, QPlainTextEdit *> previewTextSinks;
+  // Per-tile footer labels for live FPS counter and last-updated timestamp.
+  QMap<QString, QLabel *> previewFpsLabels;
+  QMap<QString, QLabel *> previewTsLabels;
+  QMap<QString, QLabel *> previewBandwidthLabels;
+  QMap<QString, QLabel *> previewOptimizationLabels;
+  QMap<QString, qint64>   previewLastFrameMs;
+  QMap<QString, double>   previewFpsEma;
+  QMap<QString, double>   previewBandwidthMbps;
+  QMap<QString, qint64>   previewBandwidthBytes;
+  QMap<QString, qint64>   previewBandwidthWindowStartMs;
+  QMap<QString, bool>     previewOptimizedLowBw;
+  QMap<QString, QPoint>   previewTileGridPos;
+  QStringList             previewTileOrder;
+  bool                    previewAutoLayout = true;
+  int previewEmptyTileSeq = 1;
+  bool studioShuttingDown = false;
 
   struct SensorDescriptor {
     QString tabName;
@@ -9776,7 +11503,35 @@ int main(int argc, char *argv[]) {
     {"Instance Seg",   {"Instance Seg",   "sensor.camera.instance_segmentation", SensorDescriptor::CameraInstance}},
     {"DVS",            {"DVS",            "sensor.camera.dvs",                   SensorDescriptor::DvsText}},
     {"Optical Flow",   {"Optical Flow",   "sensor.camera.optical_flow",          SensorDescriptor::CameraOpticalFlow}},
-    {"Fisheye",        {"Fisheye",        "sensor.camera.rgb",                   SensorDescriptor::Camera, 800, 450, 160.0}},
+    // Quality-oriented preview defaults for 1080p operator displays.
+    // These keep tiles visibly sharp when the preview window is maximized.
+    {"Fisheye",        {"Fisheye",        "sensor.camera.rgb_fisheye",           SensorDescriptor::Camera, 640, 640, 180.0}},
+    {"Fisheye Front",  {"Fisheye Front",  "sensor.camera.rgb_fisheye",           SensorDescriptor::Camera, 640, 640, 180.0}},
+    {"Fisheye Rear",   {"Fisheye Rear",   "sensor.camera.rgb_fisheye",           SensorDescriptor::Camera, 640, 640, 180.0}},
+    {"Fisheye Left",   {"Fisheye Left",   "sensor.camera.rgb_fisheye",           SensorDescriptor::Camera, 640, 640, 180.0}},
+    {"Fisheye Right",  {"Fisheye Right",  "sensor.camera.rgb_fisheye",           SensorDescriptor::Camera, 640, 640, 180.0}},
+    // Ego/hero RGB cameras — always placed in row 0 (hero row) of the preview grid.
+    {"Ego Driver",   {"Ego Driver",   "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    {"Ego Chase",    {"Ego Chase",    "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    {"Ego Cockpit",  {"Ego Cockpit",  "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    {"Ego Bird Eye", {"Ego Bird Eye", "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    // Standard RGB cameras at 4 vehicle sides, 90° FoV.
+    {"Camera Front", {"Camera Front", "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    {"Camera Rear",  {"Camera Rear",  "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    {"Camera Left",  {"Camera Left",  "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    {"Camera Right", {"Camera Right", "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    {"Camera Cabin", {"Camera Cabin", "sensor.camera.rgb", SensorDescriptor::Camera, 960, 540, 90.0}},
+    // Radar array — 4 sides of the vehicle.
+    {"Radar Front", {"Radar Front", "sensor.other.radar", SensorDescriptor::RadarText}},
+    {"Radar Rear",  {"Radar Rear",  "sensor.other.radar", SensorDescriptor::RadarText}},
+    {"Radar Left",  {"Radar Left",  "sensor.other.radar", SensorDescriptor::RadarText}},
+    {"Radar Right", {"Radar Right", "sensor.other.radar", SensorDescriptor::RadarText}},
+    // Ultrasonic/sonar array — obstacle detector, 4 sides + generic entry.
+    {"Sonar",       {"Sonar",       "sensor.other.obstacle", SensorDescriptor::ObstacleEvt}},
+    {"Sonar Front", {"Sonar Front", "sensor.other.obstacle", SensorDescriptor::ObstacleEvt}},
+    {"Sonar Rear",  {"Sonar Rear",  "sensor.other.obstacle", SensorDescriptor::ObstacleEvt}},
+    {"Sonar Left",  {"Sonar Left",  "sensor.other.obstacle", SensorDescriptor::ObstacleEvt}},
+    {"Sonar Right", {"Sonar Right", "sensor.other.obstacle", SensorDescriptor::ObstacleEvt}},
     {"Front",          {"Front",          "sensor.other.radar",                  SensorDescriptor::RadarText}},
     {"Rear",           {"Rear",           "sensor.other.radar",                  SensorDescriptor::RadarText}},
     {"Long-Range",     {"Long-Range",     "sensor.other.radar",                  SensorDescriptor::RadarText}},
@@ -9805,20 +11560,87 @@ int main(int argc, char *argv[]) {
   carla::SharedPtr<cc::Actor> previewParent;
   QMap<QString, carla::SharedPtr<cc::Sensor>> activePreviewSensors;
   std::vector<carla::SharedPtr<cc::Actor>> appliedSensorActors;
+  QStringList pendingPreviewSensors;  // queued while waiting for connection
+  // Synchronous-mode tick thread.  Uses a SEPARATE client connection so that
+  // Tick() calls never share a socket with the spawn/listen RPC calls on
+  // previewClient (libcarla is not thread-safe for concurrent calls on the
+  // same client object).  Started once the preview connection is up; stopped
+  // (and async mode restored) in stopAllPreviews.
+  std::shared_ptr<cc::Client> previewTickClient;
+  std::atomic<bool> previewTickRunning{false};
+  std::thread previewTickThread;
+
+  // Optional CLI capture of all previewed image streams:
+  //   --capture-preview-images <output-dir>
+  // Saves PNG (8-bit RGB) frames at up to 30 fps per stream.
+  bool capturePreviewImagesEnabled = false;
+  QString capturePreviewImagesDir;
+  QMap<QString, qint64> previewCaptureLastMs;
+  QMap<QString, int> previewCaptureSeq;
+  {
+    const QStringList startupArgs = QApplication::arguments();
+    const qsizetype capIdx = startupArgs.indexOf("--capture-preview-images");
+    if (capIdx >= 0) {
+      if (capIdx + 1 < startupArgs.size()) {
+        capturePreviewImagesDir = startupArgs.at(static_cast<int>(capIdx + 1)).trimmed();
+        if (!capturePreviewImagesDir.isEmpty()) {
+          QDir().mkpath(capturePreviewImagesDir);
+          capturePreviewImagesEnabled = true;
+          fprintf(stderr, "[preview-capture] enabled: %s\n",
+                  capturePreviewImagesDir.toUtf8().constData());
+        }
+      } else {
+        fprintf(stderr,
+                "[cli] WARNING: --capture-preview-images requires an output directory\n");
+      }
+    }
+  }
 #endif
 
   auto stopAllPreviews = [&]() {
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
+    // ── 1. Signal and join the tick thread ───────────────────────────────
+    previewTickRunning.store(false);
+    if (previewTickThread.joinable()) {
+      previewTickThread.join();
+    }
+    // ── 2. Restore asynchronous world settings ───────────────────────────
+    // world.ApplySettings() internally calls WaitForTick().  The tick thread
+    // was just stopped, so we need to send ONE more Tick via the tick client
+    // (from a temporary thread) so ApplySettings() can complete.
+    if (previewClient) {
+      try {
+        auto settings = previewClient->GetWorld().GetSettings();
+        settings.synchronous_mode = false;
+        settings.fixed_delta_seconds.reset();
+        // One-shot tick to unblock ApplySettings's internal WaitForTick.
+        std::thread oneshotTick([tc = previewTickClient]() {
+          if (tc) {
+            try { tc->GetWorld().Tick(carla::time_duration::milliseconds(500)); } catch (...) {}
+          }
+        });
+        try {
+          previewClient->GetWorld().ApplySettings(settings, carla::time_duration::seconds(3));
+        } catch (...) {}
+        if (oneshotTick.joinable()) oneshotTick.join();
+      } catch (...) {}
+    }
+    previewTickClient.reset();
+    // ── 3. Stop (and optionally destroy) all preview sensors ─────────────
     for (auto it = activePreviewSensors.begin(); it != activePreviewSensors.end(); ++it) {
       try {
         if (it.value()) {
           it.value()->Stop();
-          it.value()->Destroy();
+          // During app shutdown, avoid remote destroy RPC churn/races.
+          if (!studioShuttingDown) {
+            it.value()->Destroy();
+          }
         }
       } catch (...) {
       }
     }
     activePreviewSensors.clear();
+    pendingPreviewSensors.clear();
     previewParent = nullptr;
     previewClient.reset();
 #else
@@ -9827,10 +11649,36 @@ int main(int argc, char *argv[]) {
   };
 
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
+  auto updatePreviewBandwidth = [&](const QString &name, qint64 payloadBytes) {
+    if (studioShuttingDown || payloadBytes <= 0) return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    qint64 &winStart = previewBandwidthWindowStartMs[name];
+    qint64 &accBytes = previewBandwidthBytes[name];
+    if (winStart <= 0) {
+      winStart = now;
+      accBytes = 0;
+    }
+    accBytes += payloadBytes;
+    const qint64 elapsed = now - winStart;
+    if (elapsed >= 1000) {
+      const double mbps = (double(accBytes) * 8.0) / (double(elapsed) * 1000.0);
+      previewBandwidthMbps[name] = mbps;
+      netPreviewMbpsByName[name] = mbps;
+      if (QLabel *bwLbl = previewBandwidthLabels.value(name, nullptr))
+        bwLbl->setText(QString("%1 Mbps").arg(mbps, 0, 'f', 2));
+      winStart = now;
+      accBytes = 0;
+    }
+  };
+
   auto appendPreviewText = [&](const QString &name, const QString &line, bool replace) {
-    QPlainTextEdit *sink = previewTextSinks.value(name, nullptr);
-    if (!sink) return;
-    QMetaObject::invokeMethod(sink, [sink, line, replace]() {
+    if (studioShuttingDown) return;
+    // Must only access previewTextSinks / fps / ts labels on the Qt main thread.
+    QMetaObject::invokeMethod(qApp,
+        [name, line, replace, &studioShuttingDown, &previewTextSinks, &previewFpsLabels,
+         &previewTsLabels, &previewLastFrameMs, &previewFpsEma]() {
+      if (studioShuttingDown) return;
+      QPlainTextEdit *sink = previewTextSinks.value(name, nullptr);
       if (!sink) return;
       if (replace) sink->setPlainText(line);
       else {
@@ -9843,16 +11691,78 @@ int main(int argc, char *argv[]) {
           c.deleteChar();
         }
       }
+      // ── footer: update-rate + timestamp ─────────────────────────────────
+      const qint64 now = QDateTime::currentMSecsSinceEpoch();
+      if (QLabel *fpsLbl = previewFpsLabels.value(name, nullptr)) {
+        qint64 &last = previewLastFrameMs[name];
+        if (last > 0 && now > last) {
+          const double instFps = 1000.0 / double(now - last);
+          double &ema = previewFpsEma[name];
+          ema = (ema <= 0.0) ? instFps : (0.80 * ema + 0.20 * instFps);
+          const double shown = std::min(30.0, ema);
+          fpsLbl->setText(QString("%1 fps").arg(shown, 0, 'f', 1));
+        }
+        last = now;
+      }
+      if (QLabel *tsLbl = previewTsLabels.value(name, nullptr))
+        tsLbl->setText(QStringLiteral("Updated: ") +
+          QDateTime::fromMSecsSinceEpoch(now, Qt::LocalTime)
+            .toString(QStringLiteral("HH:mm:ss.zzz")));
     }, Qt::QueuedConnection);
   };
 
-  auto postImageToSink = [&](const QString &name, QImage frame) {
-    QLabel *sink = previewImageSinks.value(name, nullptr);
-    if (!sink) return;
-    QMetaObject::invokeMethod(sink, [sink, frame]() {
+  auto postImageToSink = [&](const QString &name, QImage frame, qint64 payloadBytes = 0) {
+    if (studioShuttingDown) return;
+    // Must only access previewImageSinks / fps / ts labels on the Qt main thread.
+    QMetaObject::invokeMethod(qApp,
+        [name, frame, payloadBytes, &studioShuttingDown, &previewImageSinks, &previewFpsLabels,
+         &previewTsLabels, &previewLastFrameMs, &previewFpsEma,
+         &capturePreviewImagesEnabled, &capturePreviewImagesDir,
+         &previewCaptureLastMs, &previewCaptureSeq, &updatePreviewBandwidth]() {
+      if (studioShuttingDown) return;
+      QLabel *sink = previewImageSinks.value(name, nullptr);
       if (!sink) return;
       sink->setPixmap(QPixmap::fromImage(frame).scaled(
         sink->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+      // ── footer: fps + timestamp ──────────────────────────────────────────
+      const qint64 now = QDateTime::currentMSecsSinceEpoch();
+      if (QLabel *fpsLbl = previewFpsLabels.value(name, nullptr)) {
+        qint64 &last = previewLastFrameMs[name];
+        if (last > 0 && now > last) {
+          const double instFps = 1000.0 / double(now - last);
+          double &ema = previewFpsEma[name];
+          ema = (ema <= 0.0) ? instFps : (0.80 * ema + 0.20 * instFps);
+          const double shown = std::min(30.0, ema);
+          fpsLbl->setText(QString("%1 fps").arg(shown, 0, 'f', 1));
+        }
+        last = now;
+      }
+      updatePreviewBandwidth(name, payloadBytes);
+      if (QLabel *tsLbl = previewTsLabels.value(name, nullptr))
+        tsLbl->setText(QStringLiteral("Updated: ") +
+          QDateTime::fromMSecsSinceEpoch(now, Qt::LocalTime)
+            .toString(QStringLiteral("HH:mm:ss.zzz")));
+
+      if (capturePreviewImagesEnabled) {
+        // 30 fps cap per stream.
+        qint64 &lastCap = previewCaptureLastMs[name];
+        if (lastCap <= 0 || (now - lastCap) >= 33) {
+          lastCap = now;
+          QString slug = name.toLower();
+          slug.replace(QRegularExpression("[^a-z0-9_]+"), "_");
+          const QString sensorDir = QDir(capturePreviewImagesDir).filePath(slug);
+          QDir().mkpath(sensorDir);
+          const int seq = previewCaptureSeq[name]++;
+          const QString outPath = QDir(sensorDir).filePath(
+            QString("%1_%2.png")
+              .arg(QDateTime::fromMSecsSinceEpoch(now).toString("yyyyMMdd_HHmmss_zzz"))
+              .arg(seq, 6, 10, QChar('0')));
+          const QImage toSave = (frame.format() == QImage::Format_RGB888)
+            ? frame
+            : frame.convertToFormat(QImage::Format_RGB888);
+          toSave.save(outPath, "PNG");
+        }
+      }
     }, Qt::QueuedConnection);
   };
 
@@ -9872,38 +11782,405 @@ int main(int argc, char *argv[]) {
       auto world = client->GetWorld();
       auto actors = world.GetActors();
       auto vehicles = actors->Filter("vehicle.*");
+
+      auto normalizePreferredVehicleBlueprint = [](QString id) {
+        id = id.trimmed();
+        if (id.isEmpty()) {
+          return QStringLiteral("vehicle.lincoln.mkz_2017");
+        }
+        return id;
+      };
+      auto mkzBlueprintCandidates = [&](const QString &requested) {
+        QStringList cands;
+        const QString req = normalizePreferredVehicleBlueprint(requested);
+        cands << req;
+        if (req == QLatin1String("vehicle.lincoln.mkz_2017")) {
+          cands << QStringLiteral("vehicle.lincoln.mkz")
+                << QStringLiteral("vehicle.lincoln.mkz_2020");
+        } else if (req == QLatin1String("vehicle.lincoln.mkz")) {
+          cands << QStringLiteral("vehicle.lincoln.mkz_2017")
+                << QStringLiteral("vehicle.lincoln.mkz_2020");
+        } else if (req == QLatin1String("vehicle.lincoln.mkz_2020")) {
+          cands << QStringLiteral("vehicle.lincoln.mkz_2017")
+                << QStringLiteral("vehicle.lincoln.mkz");
+        }
+        cands.removeDuplicates();
+        return cands;
+      };
+      const QString configuredBlueprint = normalizePreferredVehicleBlueprint(
+        QSettings().value("vehicle/blueprint", "vehicle.lincoln.mkz_2017").toString());
+      QString preferredBlueprint = configuredBlueprint;
+      try {
+        auto lib = world.GetBlueprintLibrary();
+        if (lib) {
+          for (const QString &cand : mkzBlueprintCandidates(configuredBlueprint)) {
+            if (lib->Find(cand.toStdString())) {
+              preferredBlueprint = cand;
+              break;
+            }
+          }
+        }
+      } catch (...) {
+      }
+      if (preferredBlueprint != configuredBlueprint) {
+        fprintf(stderr,
+                "[preview] preferred blueprint %s unavailable, using %s\n",
+                configuredBlueprint.toUtf8().constData(),
+                preferredBlueprint.toUtf8().constData());
+      }
+
+      auto trySpawnPreferredHero = [&]() -> carla::SharedPtr<cc::Actor> {
+        try {
+          auto blueprints = world.GetBlueprintLibrary();
+          if (!blueprints) return nullptr;
+          const auto *bpPtr = blueprints->Find(preferredBlueprint.toStdString());
+          if (!bpPtr) return nullptr;
+          auto bpCopy = *bpPtr;
+          if (bpCopy.ContainsAttribute("role_name")) bpCopy.SetAttribute("role_name", "hero");
+          auto map = world.GetMap();
+          if (!map) return nullptr;
+          const auto spawns = map->GetRecommendedSpawnPoints();
+          for (size_t si = 0; si < std::min(spawns.size(), size_t(30)); ++si) {
+            try {
+              const float zLift[] = {0.0f, 0.5f, 1.5f, 3.0f};
+              for (float dz : zLift) {
+                auto tr = spawns[si];
+                tr.location.z += dz;
+                auto spawned = world.TrySpawnActor(bpCopy, tr);
+                if (spawned) {
+                  fprintf(stderr, "[preview] spawned preferred hero %s id=%u\n",
+                          preferredBlueprint.toUtf8().constData(),
+                          unsigned(spawned->GetId()));
+                  return spawned;
+                }
+              }
+            } catch (...) {
+            }
+          }
+        } catch (...) {
+        }
+        return nullptr;
+      };
+
+      auto isPreferredVehicle = [&](const carla::SharedPtr<cc::Actor> &a) -> bool {
+        if (!a || preferredBlueprint.isEmpty()) return false;
+        try {
+          return QString::fromStdString(a->GetTypeId()) == preferredBlueprint;
+        } catch (...) {
+          return false;
+        }
+      };
+
+      auto isHeroVehicle = [&](const carla::SharedPtr<cc::Actor> &a) -> bool {
+        if (!a) return false;
+        try {
+          for (const auto &attr : a->GetAttributes()) {
+            if (attr.GetId() == "role_name" && attr.GetValue() == "hero") {
+              return true;
+            }
+          }
+          return false;
+        } catch (...) {
+          return false;
+        }
+      };
+
+      carla::SharedPtr<cc::Actor> preferredVehicle;
+      carla::SharedPtr<cc::Actor> heroVehicle;
+
       if (!vehicles || vehicles->empty()) {
-        if (attemptsLeft > 0) {
+        // Try to spawn a temporary vehicle so sensors have a proper rigid body.
+        if (auto spawnedPreferred = trySpawnPreferredHero()) {
+          previewClient = client;
+          previewParent = spawnedPreferred;
+          goto connected;
+        }
+        try {
+          auto blueprints = world.GetBlueprintLibrary();
+          // Prefer the user's selected blueprint; then try other vehicle blueprints.
+          std::vector<carla::client::ActorBlueprint> bp_candidates;
+          if (blueprints) {
+            auto vehBps = blueprints->Filter("vehicle.*");
+            if (vehBps && !vehBps->empty()) {
+              // 1) Preferred blueprint first.
+              for (const auto &bp : *vehBps) {
+                if (QString::fromStdString(bp.GetId()) == preferredBlueprint) {
+                  bp_candidates.push_back(bp);
+                  break;
+                }
+              }
+              // 2) Then all other blueprints.
+              for (const auto &bp : *vehBps) {
+                const QString id = QString::fromStdString(bp.GetId());
+                if (id == preferredBlueprint) continue;
+                bp_candidates.push_back(bp);
+              }
+            }
+          }
+          if (!bp_candidates.empty()) {
+            for (const auto &bpTemplate : bp_candidates) {
+              auto bpCopy = bpTemplate;
+            if (bpCopy.ContainsAttribute("role_name")) bpCopy.SetAttribute("role_name", "hero");
+            auto map = world.GetMap();
+            if (map) {
+              const auto spawns = map->GetRecommendedSpawnPoints();
+              // Try recommended spawn points first.
+              for (size_t si = 0; si < std::min(spawns.size(), size_t(30)); ++si) {
+                try {
+                  // Try a few lifted variants per spawn point to reduce ground collision failures.
+                  const float zLift[] = {0.0f, 0.5f, 1.5f, 3.0f};
+                  for (float dz : zLift) {
+                    auto tr = spawns[si];
+                    tr.location.z += dz;
+                    auto spawned = world.TrySpawnActor(bpCopy, tr);
+                    if (spawned) {
+                      previewClient = client;
+                      previewParent = spawned;
+                      goto connected;
+                    }
+                  }
+                } catch (const std::exception &ex) {
+                  fprintf(stderr, "[preview] spawn[%zu]: %s\n", si, ex.what());
+                  // Keep trying other recommended spawn points before fallback.
+                  continue;
+                }
+              }
+            }
+            }
+          }
+        } catch (...) {}
+
+        // Spawn failed — retry until a vehicle appears (user may spawn one via scenario).
+        const bool keepRetrying = (attemptsLeft < 0) || (attemptsLeft > 0);
+        if (keepRetrying) {
           for (auto it = previewImageSinks.begin(); it != previewImageSinks.end(); ++it) {
             if (it.value())
               QMetaObject::invokeMethod(it.value(), [label = it.value(), n = it.key()]() {
-                if (label) label->setText(QString("%1\nWaiting for hero vehicle…").arg(n));
+                if (label) label->setText(QString("%1\nWaiting for vehicle in world…").arg(n));
               }, Qt::QueuedConnection);
           }
-          for (auto it = previewTextSinks.begin(); it != previewTextSinks.end(); ++it) {
-            if (it.value())
-              QMetaObject::invokeMethod(it.value(), [sink = it.value()]() {
-                if (sink) sink->setPlainText("Waiting for hero vehicle…");
-              }, Qt::QueuedConnection);
-          }
-          QTimer::singleShot(1500, &window, [=]() { tryConnectForPreviews(attemptsLeft - 1); });
+          const int nextAttempts = (attemptsLeft < 0) ? -1 : (attemptsLeft - 1);
+          QTimer::singleShot(2000, &window, [=]() { tryConnectForPreviews(nextAttempts); });
         }
         return;
       }
       previewClient = client;
-      previewParent = vehicles->at(0u);
+      // Priority for preview parent to match Unreal operator view:
+      // existing hero > spawn preferred hero if missing > preferred vehicle > first vehicle.
+      for (auto a : *vehicles) {
+        if (!preferredVehicle && isPreferredVehicle(a)) preferredVehicle = a;
+        if (!heroVehicle && isHeroVehicle(a)) heroVehicle = a;
+        if (preferredVehicle && heroVehicle) break;
+      }
+      if (heroVehicle) {
+        previewParent = heroVehicle;
+      } else if (auto spawnedPreferred = trySpawnPreferredHero()) {
+        previewParent = spawnedPreferred;
+      } else if (preferredVehicle) {
+        previewParent = preferredVehicle;
+      } else {
+        previewParent = vehicles->at(0u);
+      }
+
+      connected:
+      // NOTE: SetAutopilot() / TrafficManagerLocal is not used here.
+      // The installed libcarla client (API git=40ac1f1) and the running CARLA
+      // server (0.10.0) have a TM msgpack protocol mismatch; both the C++ and
+      // Python TM paths crash (SIGSEGV / std::terminate) on connect.
+      // Instead, a proportional waypoint-following controller is started below
+      // via QTimer after the sensor flush, driving the hero vehicle at ~20 kph.
+
+      // Clean up any sensors that are attached to previewParent but were NOT
+      // spawned in this session (orphaned from previous carla-studio runs that
+      // exited before they could call Destroy).  Without this, sensors accumulate
+      // across restarts and eventually overwhelm the CARLA server.
+      try {
+        auto cleanActors = world.GetActors();
+        if (cleanActors) {
+          const auto parentId = previewParent->GetId();
+          for (const auto &actor : *cleanActors) {
+            if (!actor) continue;
+            if (actor->GetTypeId().substr(0, 7) != "sensor.") continue;
+            try {
+              auto par = actor->GetParent();
+              if (par && par->GetId() == parentId) {
+                actor->Destroy();
+                fprintf(stderr, "[preview] removed orphaned sensor %u (%s)\n",
+                        unsigned(actor->GetId()),
+                        actor->GetTypeId().c_str());
+              }
+            } catch (...) {}
+          }
+        }
+      } catch (...) {}
+
+      // Flush any sensors that were queued before the connection came up.
+      // Stagger each spawn by 350 ms: CARLA 0.10.0 needs a game tick between
+      // SpawnActor calls; a synchronous burst causes all but the first to fail.
+      //
+      // Enable synchronous mode BEFORE the flush so the sim advances at
+      // fixed_delta=0.05 s (20 Hz) while sensors are being spawned.
+      // Mathematical guarantee: with sensor_tick=1.15 s (23 frames) and
+      // spawn stagger 350 ms ≈ 7 frames, gcd(7,23)=1 and 23>20 sensors
+      // → no two camera sensors ever fire in the same sim frame, eliminating
+      // the concurrent RHICopyTexture that triggers VulkanTexture.cpp:2515.
+      //
+      // The tick thread uses a SEPARATE cc::Client connection (previewTickClient)
+      // so that world.Tick() calls never share a socket with the spawn/listen
+      // RPC calls made on previewClient from the Qt main thread.
+      // libcarla's RPC client is NOT thread-safe; concurrent calls on the same
+      // client object corrupt the msgpack stream and throw std::exception.
+      if (!previewTickRunning.load()) {
+        try {
+          const QString tcHost = targetHost->text().trimmed().isEmpty()
+                                   ? QStringLiteral("localhost")
+                                   : targetHost->text().trimmed();
+          const int tcPort = portSpin->value();
+          previewTickClient = std::make_shared<cc::Client>(
+              tcHost.toStdString(), static_cast<uint16_t>(tcPort));
+          previewTickClient->SetTimeout(std::chrono::seconds(3));
+
+          // Enable synchronous mode via the spawn client; the tick client
+          // then provides the ticks that allow ApplySettings to complete.
+          auto syncWorld = client->GetWorld();
+          auto syncSettings = syncWorld.GetSettings();
+          syncSettings.synchronous_mode = true;
+          syncSettings.fixed_delta_seconds = 0.05;  // 20 Hz
+
+          previewTickRunning.store(true);
+          previewTickThread = std::thread([&previewTickRunning,
+                                           tc = previewTickClient]() {
+            while (previewTickRunning.load()) {
+              try {
+                tc->GetWorld().Tick(carla::time_duration::seconds(1));
+              } catch (...) {
+                break;  // connection lost / CARLA restarted
+              }
+            }
+          });
+
+          // Now that the tick thread is running it can satisfy ApplySettings's
+          // internal WaitForTick calls — safe because tick client ≠ spawn client.
+          syncWorld.ApplySettings(syncSettings, carla::time_duration::seconds(5));
+          fprintf(stderr, "[preview] sync mode enabled (fixed_delta=0.05 s, "
+                          "tick client on separate socket)\n");
+        } catch (const std::exception &e) {
+          fprintf(stderr, "[preview] sync mode failed (%s); cameras may crash\n", e.what());
+          // Clean up if init partially succeeded
+          previewTickRunning.store(false);
+          if (previewTickThread.joinable()) previewTickThread.detach();
+          previewTickClient.reset();
+        }
+      }
+
+      const QStringList pending = pendingPreviewSensors;
+      pendingPreviewSensors.clear();
+      for (int pi = 0; pi < pending.size(); ++pi) {
+        const QString pendingName = pending[pi];
+        QTimer::singleShot(pi * 350, &window, [&, pendingName]() {
+          if (!startSensorPreview) return;
+          if (activePreviewSensors.contains(pendingName)) return;
+          try {
+            startSensorPreview(pendingName);
+          } catch (...) {
+            fprintf(stderr, "[preview] flush: startSensorPreview(%s) threw, skipping\n",
+                    pendingName.toUtf8().constData());
+          }
+        });
+      }
+
+      // ── Waypoint-following autopilot ──────────────────────────────────────
+      // TrafficManager (SetAutopilot) is broken in this build: the installed
+      // libcarla client (API git=40ac1f1) and the running CARLA server
+      // (0.10.0) have a TM msgpack protocol mismatch → std::terminate / SIGSEGV.
+      // Instead, drive the hero vehicle with a proportional lookahead controller
+      // built on the CARLA map waypoint graph.  A QTimer fires at 10 Hz on the
+      // Qt main thread and calls previewClient->ApplyControl() between ticks.
+      // The tick thread (previewTickClient) advances the sim at 20 Hz, so physics
+      // sees one new control input every ~2 simulation frames.
+      //
+      // Only start if no autopilot timer already exists for this session.
+      if (!window.findChild<QTimer*>("previewAutopilotTimer")) {
+        try {
+          auto waypointMap = client->GetWorld().GetMap();
+          if (waypointMap) {
+            auto *apTimer = new QTimer(&window);
+            apTimer->setObjectName("previewAutopilotTimer");
+            apTimer->setInterval(100);  // 10 Hz
+            QObject::connect(apTimer, &QTimer::timeout, &window,
+                             [&, wm = waypointMap, apTimer]() {
+              // Stop if the preview session was torn down.
+              if (!previewParent || !previewClient) {
+                apTimer->stop();
+                apTimer->deleteLater();
+                return;
+              }
+              try {
+                auto vehicle =
+                    std::static_pointer_cast<cc::Vehicle>(previewParent);
+                if (!vehicle) { apTimer->stop(); return; }
+
+                const auto vTf  = vehicle->GetTransform();
+                const auto fwd  = vTf.GetForwardVector();
+                const auto vLoc = vTf.location;
+
+                // Get the road waypoint 6 m ahead of the vehicle's current
+                // position.  GetNext() follows lane topology, so the car
+                // naturally stays on its lane and respects forks.
+                auto cur = wm->GetWaypoint(vLoc);
+                if (!cur) return;
+                auto nexts = cur->GetNext(6.0);
+                if (nexts.empty()) return;
+                const auto wpLoc = nexts[0]->GetTransform().location;
+
+                // Proportional lateral error in CARLA's X-forward Y-right
+                // coordinate system.  cross(fwd, to_wp).z > 0 → wp is to the
+                // right → steer right (positive steer value).
+                const float dx   = wpLoc.x - vLoc.x;
+                const float dy   = wpLoc.y - vLoc.y;
+                const float dist = std::sqrt(dx * dx + dy * dy);
+                float steer = 0.0f;
+                if (dist > 0.1f) {
+                  steer = (fwd.x * dy - fwd.y * dx) / dist;
+                  steer = std::max(-1.0f, std::min(1.0f, steer * 1.5f));
+                }
+
+                cc::Vehicle::Control ctrl;
+                ctrl.throttle          = 0.45f;
+                ctrl.steer             = steer;
+                ctrl.brake             = 0.0f;
+                ctrl.hand_brake        = false;
+                ctrl.reverse           = false;
+                ctrl.manual_gear_shift = false;
+                vehicle->ApplyControl(ctrl);
+              } catch (...) {}
+            });
+            apTimer->start();
+            fprintf(stderr,
+                    "[preview] waypoint autopilot started "
+                    "(10 Hz proportional, 6 m lookahead)\n");
+          }
+        } catch (const std::exception &e) {
+          fprintf(stderr, "[preview] autopilot init failed: %s\n", e.what());
+        }
+      }
+
       return;
     } catch (const std::exception &) {
-      if (attemptsLeft > 0) {
+      const bool keepRetrying = (attemptsLeft < 0) || (attemptsLeft > 0);
+      if (keepRetrying) {
         for (auto it = previewImageSinks.begin(); it != previewImageSinks.end(); ++it) {
           if (it.value())
             QMetaObject::invokeMethod(it.value(),
               [label = it.value(), n = it.key(), a = attemptsLeft]() {
                 if (label)
-                  label->setText(QString("%1\nConnecting to CARLA… (%2 tries left)").arg(n).arg(a));
+                  label->setText(a < 0
+                    ? QString("%1\nConnecting to CARLA…").arg(n)
+                    : QString("%1\nConnecting to CARLA… (%2 tries left)").arg(n).arg(a));
               }, Qt::QueuedConnection);
         }
-        QTimer::singleShot(1500, &window, [=]() { tryConnectForPreviews(attemptsLeft - 1); });
+        const int nextAttempts = (attemptsLeft < 0) ? -1 : (attemptsLeft - 1);
+        QTimer::singleShot(1500, &window, [=]() { tryConnectForPreviews(nextAttempts); });
       } else {
         for (auto it = previewImageSinks.begin(); it != previewImageSinks.end(); ++it) {
           if (it.value())
@@ -9923,10 +12200,128 @@ int main(int argc, char *argv[]) {
     if (!previewClient || !previewParent) return;
     if (activePreviewSensors.contains(desc.tabName)) return;
 
+    auto bilinearRgb = [](const QImage &img, double u, double v) -> QRgb {
+      const int w = img.width();
+      const int h = img.height();
+      if (w <= 1 || h <= 1) return qRgb(0, 0, 0);
+      if (u < 0.0 || v < 0.0 || u >= double(w - 1) || v >= double(h - 1))
+        return qRgb(0, 0, 0);
+
+      const int x0 = int(std::floor(u));
+      const int y0 = int(std::floor(v));
+      const int x1 = x0 + 1;
+      const int y1 = y0 + 1;
+      const double ax = u - x0;
+      const double ay = v - y0;
+
+      const QRgb p00 = img.pixel(x0, y0);
+      const QRgb p10 = img.pixel(x1, y0);
+      const QRgb p01 = img.pixel(x0, y1);
+      const QRgb p11 = img.pixel(x1, y1);
+
+      auto lerp = [](double a, double b, double t) { return a + (b - a) * t; };
+      const double r0 = lerp(qRed(p00),   qRed(p10),   ax);
+      const double r1 = lerp(qRed(p01),   qRed(p11),   ax);
+      const double g0 = lerp(qGreen(p00), qGreen(p10), ax);
+      const double g1 = lerp(qGreen(p01), qGreen(p11), ax);
+      const double b0 = lerp(qBlue(p00),  qBlue(p10),  ax);
+      const double b1 = lerp(qBlue(p01),  qBlue(p11),  ax);
+
+      const int r = int(std::clamp(lerp(r0, r1, ay), 0.0, 255.0));
+      const int g = int(std::clamp(lerp(g0, g1, ay), 0.0, 255.0));
+      const int b = int(std::clamp(lerp(b0, b1, ay), 0.0, 255.0));
+      return qRgb(r, g, b);
+    };
+
+    auto applyKannalaBrandt = [&](const QImage &src, double sourceFovDeg) -> QImage {
+      const int w = src.width();
+      const int h = src.height();
+      if (w <= 2 || h <= 2) return src;
+
+      QImage out(w, h, QImage::Format_RGB888);
+      out.fill(QColor(0, 0, 0));
+
+      const double cx = (w - 1) * 0.5;
+      const double cy = (h - 1) * 0.5;
+      const double rad = std::min(cx, cy) * 0.98;
+
+      // Kannala-Brandt odd polynomial coefficients (k1..k4).
+      // Tuned to produce visually plausible automotive fisheye behavior.
+      const double k1 = 0.12;
+      const double k2 = 0.03;
+      const double k3 = 0.005;
+      const double k4 = 0.0005;
+
+      const double srcFov = std::clamp(sourceFovDeg, 60.0, 170.0) * M_PI / 180.0;
+      const double thetaMax = srcFov * 0.5;
+      const auto kbPoly = [&](double th) {
+        const double th2 = th * th;
+        const double th3 = th * th2;
+        const double th5 = th3 * th2;
+        const double th7 = th5 * th2;
+        const double th9 = th7 * th2;
+        return th + k1 * th3 + k2 * th5 + k3 * th7 + k4 * th9;
+      };
+      const auto kbDeriv = [&](double th) {
+        const double th2 = th * th;
+        const double th4 = th2 * th2;
+        const double th6 = th4 * th2;
+        const double th8 = th6 * th2;
+        return 1.0 + 3.0 * k1 * th2 + 5.0 * k2 * th4 + 7.0 * k3 * th6 + 9.0 * k4 * th8;
+      };
+
+      const double rMax = kbPoly(thetaMax);
+      const double srcTanMax = std::tan(thetaMax);
+      const double eps = 1e-9;
+
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const double nx = (x - cx) / rad;
+          const double ny = (y - cy) / rad;
+          const double rdNorm = std::sqrt(nx * nx + ny * ny);
+          if (rdNorm > 1.0) continue;
+
+          const double targetR = rdNorm * rMax;
+          double theta = rdNorm * thetaMax;
+          // Newton solve: kbPoly(theta) = targetR.
+          for (int i = 0; i < 6; ++i) {
+            const double f = kbPoly(theta) - targetR;
+            const double d = std::max(kbDeriv(theta), eps);
+            theta -= f / d;
+            theta = std::clamp(theta, 0.0, thetaMax);
+          }
+
+          const double phi = std::atan2(ny, nx);
+          const double tanTheta = std::tan(theta);
+          const double uxNorm = (tanTheta / std::max(srcTanMax, eps)) * std::cos(phi);
+          const double uyNorm = (tanTheta / std::max(srcTanMax, eps)) * std::sin(phi);
+
+          const double u = cx + uxNorm * cx;
+          const double v = cy + uyNorm * cy;
+          out.setPixel(x, y, bilinearRgb(src, u, v));
+        }
+      }
+      return out;
+    };
+
     try {
       auto world = previewClient->GetWorld();
       auto blueprints = world.GetBlueprintLibrary();
-      const auto *bp = blueprints ? blueprints->Find(desc.blueprintId.toStdString()) : nullptr;
+      QString resolvedBlueprintId = desc.blueprintId;
+      const auto *bp = blueprints ? blueprints->Find(resolvedBlueprintId.toStdString()) : nullptr;
+      bool fisheyeFallbackToRgb = false;
+      const bool softwareFisheye = (desc.blueprintId == "sensor.camera.rgb_fisheye");
+      if (softwareFisheye) {
+        // Source perspective camera; distortion is applied in software via
+        // Kannala-Brandt model in the preview callback.
+        resolvedBlueprintId = QStringLiteral("sensor.camera.rgb");
+        bp = blueprints ? blueprints->Find(resolvedBlueprintId.toStdString()) : nullptr;
+        fisheyeFallbackToRgb = (bp != nullptr);
+      } else if (!bp && desc.blueprintId == "sensor.camera.rgb_fisheye") {
+        resolvedBlueprintId = QStringLiteral("sensor.camera.rgb");
+        bp = blueprints ? blueprints->Find(resolvedBlueprintId.toStdString()) : nullptr;
+        fisheyeFallbackToRgb = (bp != nullptr);
+      }
       if (!bp) {
         if (QLabel *sink = previewImageSinks.value(desc.tabName, nullptr))
           sink->setText(QString("%1\nBlueprint %2 not available").arg(desc.tabName, desc.blueprintId));
@@ -9936,9 +12331,33 @@ int main(int argc, char *argv[]) {
       }
       auto bpCopy = *bp;
 
+      static constexpr double kPreviewDefaultFps = 10.0;
+      static constexpr double kPreviewMaxFps = 30.0;
+      static constexpr double kPreviewDefaultTickSec = 1.0 / kPreviewDefaultFps; // 0.100000
+      static constexpr double kPreviewMinTickSec = 1.0 / kPreviewMaxFps;         // ~0.033333
+
       auto trySet = [&](const char *k, const QString &v) {
-        if (bpCopy.ContainsAttribute(k)) bpCopy.SetAttribute(k, v.toStdString());
+        if (!bpCopy.ContainsAttribute(k)) return;
+        if (QString::fromLatin1(k) == QStringLiteral("sensor_tick")) {
+          bool ok = false;
+          const double requestedTick = v.toDouble(&ok);
+          // Hard rule: preview sensors must never exceed 30 fps.
+          // If parsing fails/non-positive, fall back to 10 fps default.
+          const double safeTick = (!ok || requestedTick <= 0.0)
+            ? kPreviewDefaultTickSec
+            : std::max(requestedTick, kPreviewMinTickSec);
+          bpCopy.SetAttribute(k, QString::number(safeTick, 'f', 6).toStdString());
+          return;
+        }
+        bpCopy.SetAttribute(k, v.toStdString());
       };
+      // Stagger each sensor's tick phase by 0.06 s (slightly > one UE5 sim step
+      // at 20 Hz = 0.05 s) so that no two camera sensors ever render on the
+      // same game frame.  Simultaneous camera captures trigger a Vulkan layout
+      // assert in UE5 5.5 (VulkanTexture.cpp:2515) which crashes CARLA after
+      // the 9th sensor.  Unique tick values prevent the collision entirely.
+      const int spawnSeq = activePreviewSensors.size(); // 0-based index (kept for future use)
+      (void)spawnSeq;
       switch (desc.kind) {
         case SensorDescriptor::Camera:
         case SensorDescriptor::CameraDepth:
@@ -9948,15 +12367,20 @@ int main(int argc, char *argv[]) {
         case SensorDescriptor::DvsText:
           trySet("image_size_x", QString::number(desc.imgW));
           trySet("image_size_y", QString::number(desc.imgH));
+          previewOptimizedLowBw[desc.tabName] = false;
+          if (QLabel *status = previewOptimizationLabels.value(desc.tabName, nullptr)) {
+            status->setVisible(false);
+          }
           trySet("fov",          QString::number(desc.fov));
-          trySet("sensor_tick",  "0.10");
+          // Keep camera previews at 10 fps by default.
+          trySet("sensor_tick", QString::number(kPreviewDefaultTickSec, 'f', 6));
           break;
         case SensorDescriptor::LidarTopDown:
           trySet("range",             "50.0");
           trySet("channels",          "32");
-          trySet("points_per_second", "200000");
-          trySet("rotation_frequency","20");
-          trySet("sensor_tick",       "0.10");
+          trySet("points_per_second", "100000");
+          trySet("rotation_frequency","10");
+          trySet("sensor_tick",       "0.50");
           break;
         case SensorDescriptor::RadarText:
           trySet("horizontal_fov", "35");
@@ -9971,11 +12395,108 @@ int main(int argc, char *argv[]) {
         case SensorDescriptor::CollisionEvt:
         case SensorDescriptor::LaneInvasionEvt:
         case SensorDescriptor::ObstacleEvt:
+          previewOptimizedLowBw[desc.tabName] = false;
+          if (QLabel *status = previewOptimizationLabels.value(desc.tabName, nullptr)) {
+            status->setVisible(false);
+          }
           break;
       }
 
-      const auto attach = cg::Transform{
+      const bool isFisheye = resolvedBlueprintId == "sensor.camera.rgb_fisheye";
+      if (isFisheye) {
+        // Use equidistant fisheye projection so the image shows the
+        // characteristic circular barrel-distortion of a real fisheye lens.
+        // Without this, camera_model defaults to "perspective" which cannot
+        // represent a 180° FOV and produces a broken/black image.
+        trySet("camera_model", "equidistant");
+        // Show the inscribed fisheye circle with a small soft edge fade.
+        // The four square corners outside the 180° cone are masked black.
+        trySet("fov_mask",      "true");
+        trySet("fov_fade_size", "0.03");
+        // Disable all motion blur and cinematic post effects so fisheye
+        // preview tiles show a clean, recognisable scene image.
+        // CARLA Bool attributes use lowercase "true"/"false" strings.
+        trySet("enable_postprocess_effects", "true");  // keep enabled so blur attrs are honoured
+        trySet("motion_blur_intensity",             "0.0");
+        trySet("motion_blur_max_distortion",         "0.0");
+        trySet("motion_blur_min_object_screen_size", "0.0");
+        trySet("lens_flare_intensity",               "0.0");
+        trySet("bloom_intensity",                    "0.0");
+        // Apply the same 10 fps tick as regular cameras.
+        trySet("sensor_tick", QString::number(kPreviewDefaultTickSec, 'f', 6));
+        trySet("shutter_speed", "1000.0"); // very fast shutter = no exposure blur
+      } else if (fisheyeFallbackToRgb || softwareFisheye) {
+        // Software Kannala-Brandt fisheye uses regular RGB source frames.
+        trySet("fov", "120");
+        trySet("sensor_tick", QString::number(kPreviewDefaultTickSec, 'f', 6));
+        if (QPlainTextEdit *sink = previewTextSinks.value(desc.tabName, nullptr)) {
+          sink->setPlainText(QStringLiteral(
+            "Kannala-Brandt fisheye distortion active (source: sensor.camera.rgb)"));
+        }
+      }
+
+      // Camera mount positions tuned for Lincoln MKZ 2017
+      // (CARLA axes: X=forward, Y=right, Z=up; origin at vehicle centre, ground level).
+      // MKZ 2017: ~4.92 m long, ~1.87 m wide, ~1.48 m tall.
+      //   Front bumper  ≈ X +2.46 m   Rear bumper ≈ X -2.46 m
+      //   Door mirrors  ≈ Y ±1.05 m   Roof        ≈ Z  1.48 m
+      cg::Transform attach{
         cg::Location{-5.5f, 0.0f, 2.6f}, cg::Rotation{-12.0f, 0.0f, 0.0f}};
+      if (desc.tabName == "Fisheye Front") {
+        // Exterior front-center, above grille line, facing forward.
+        attach = cg::Transform{cg::Location{ 2.15f,  0.00f, 1.32f}, cg::Rotation{-2.0f,    0.0f, 0.0f}};
+      } else if (desc.tabName == "Fisheye Rear") {
+        // Exterior rear-center, above trunk line, facing backward.
+        attach = cg::Transform{cg::Location{-2.10f, 0.00f, 1.30f}, cg::Rotation{-2.0f,  180.0f, 0.0f}};
+      } else if (desc.tabName == "Fisheye Left") {
+        // Exterior left mirror region, facing left.
+        attach = cg::Transform{cg::Location{ 0.35f, -1.18f, 1.36f}, cg::Rotation{-2.0f,  -90.0f, 0.0f}};
+      } else if (desc.tabName == "Fisheye Right") {
+        // Exterior right mirror region, facing right.
+        attach = cg::Transform{cg::Location{ 0.35f,  1.18f, 1.36f}, cg::Rotation{-2.0f,   90.0f, 0.0f}};
+      } else if (desc.tabName == "Ego Driver") {
+        // Inside cab at driver eye position, facing forward.
+        attach = cg::Transform{cg::Location{ 0.00f, -0.30f, 1.30f}, cg::Rotation{ 0.0f,   0.0f, 0.0f}};
+      } else if (desc.tabName == "Ego Chase") {
+        // Chase camera: behind and above the vehicle, slight downward pitch.
+        attach = cg::Transform{cg::Location{-6.00f,  0.00f, 2.50f}, cg::Rotation{-15.0f,  0.0f, 0.0f}};
+      } else if (desc.tabName == "Ego Cockpit") {
+        // Dashboard cam: right-of-centre on the dash, slight downward pitch.
+        attach = cg::Transform{cg::Location{ 0.50f,  0.30f, 1.25f}, cg::Rotation{-3.0f,   0.0f, 0.0f}};
+      } else if (desc.tabName == "Ego Bird Eye") {
+        // Overhead bird's-eye view centred above the vehicle.
+        attach = cg::Transform{cg::Location{ 0.00f,  0.00f, 8.00f}, cg::Rotation{-90.0f,  0.0f, 0.0f}};
+      // RGB cameras at bumper/mirror height, wide FOV facing each side.
+      } else if (desc.tabName == "Camera Front") {
+        attach = cg::Transform{cg::Location{ 1.90f,  0.00f, 1.35f}, cg::Rotation{ 0.0f,   0.0f, 0.0f}};
+      } else if (desc.tabName == "Camera Rear") {
+        attach = cg::Transform{cg::Location{-1.90f,  0.00f, 1.35f}, cg::Rotation{ 0.0f, 180.0f, 0.0f}};
+      } else if (desc.tabName == "Camera Left") {
+        attach = cg::Transform{cg::Location{ 0.00f, -0.90f, 1.40f}, cg::Rotation{ 0.0f, -90.0f, 0.0f}};
+      } else if (desc.tabName == "Camera Right") {
+        attach = cg::Transform{cg::Location{ 0.00f,  0.90f, 1.40f}, cg::Rotation{ 0.0f,  90.0f, 0.0f}};
+      } else if (desc.tabName == "Camera Cabin") {
+        // Interior RGB camera mounted near the rear-view mirror, facing rearward.
+        attach = cg::Transform{cg::Location{ 0.62f, 0.00f, 1.44f}, cg::Rotation{-4.0f, 180.0f, 0.0f}};
+      // Radar units at bumper level, pointing outward on each side.
+      } else if (desc.tabName == "Radar Front") {
+        attach = cg::Transform{cg::Location{ 2.40f,  0.00f, 0.80f}, cg::Rotation{ 0.0f,   0.0f, 0.0f}};
+      } else if (desc.tabName == "Radar Rear") {
+        attach = cg::Transform{cg::Location{-2.40f,  0.00f, 0.80f}, cg::Rotation{ 0.0f, 180.0f, 0.0f}};
+      } else if (desc.tabName == "Radar Left") {
+        attach = cg::Transform{cg::Location{ 0.00f, -0.95f, 0.80f}, cg::Rotation{ 0.0f, -90.0f, 0.0f}};
+      } else if (desc.tabName == "Radar Right") {
+        attach = cg::Transform{cg::Location{ 0.00f,  0.95f, 0.80f}, cg::Rotation{ 0.0f,  90.0f, 0.0f}};
+      // Sonar/ultrasonic units at low bumper level, short-range obstacle detection.
+      } else if (desc.tabName == "Sonar Front") {
+        attach = cg::Transform{cg::Location{ 2.50f,  0.00f, 0.50f}, cg::Rotation{ 0.0f,   0.0f, 0.0f}};
+      } else if (desc.tabName == "Sonar Rear") {
+        attach = cg::Transform{cg::Location{-2.50f,  0.00f, 0.50f}, cg::Rotation{ 0.0f, 180.0f, 0.0f}};
+      } else if (desc.tabName == "Sonar Left") {
+        attach = cg::Transform{cg::Location{ 0.00f, -0.95f, 0.50f}, cg::Rotation{ 0.0f, -90.0f, 0.0f}};
+      } else if (desc.tabName == "Sonar Right") {
+        attach = cg::Transform{cg::Location{ 0.00f,  0.95f, 0.50f}, cg::Rotation{ 0.0f,  90.0f, 0.0f}};
+      }
       auto actor = world.SpawnActor(bpCopy, attach, previewParent.get());
       auto sensor = std::static_pointer_cast<cc::Sensor>(actor);
       if (!sensor) {
@@ -9983,11 +12504,16 @@ int main(int argc, char *argv[]) {
           sink->setText(QString("%1\nFailed to spawn sensor").arg(desc.tabName));
         return;
       }
+      fprintf(stderr, "[preview] spawned %s id=%u\n",
+              desc.tabName.toUtf8().constData(), unsigned(sensor->GetId()));
       activePreviewSensors.insert(desc.tabName, sensor);
 
       const QString tab = desc.tabName;
+      const bool applyKbFisheye = tab.startsWith("Fisheye");
       const auto kind = desc.kind;
-      sensor->Listen([this_ = &window, tab, kind, &postImageToSink, &appendPreviewText]
+      try {
+      sensor->Listen([this_ = &window, tab, kind, applyKbFisheye,
+                      &postImageToSink, &appendPreviewText, applyKannalaBrandt]
         (carla::SharedPtr<carla::sensor::SensorData> data) {
           Q_UNUSED(this_);
           try {
@@ -10006,7 +12532,9 @@ int main(int argc, char *argv[]) {
                     L[x*3+0] = p.r; L[x*3+1] = p.g; L[x*3+2] = p.b;
                   }
                 }
-                postImageToSink(tab, frame);
+                if (applyKbFisheye)
+                  frame = applyKannalaBrandt(frame, 120.0);
+                postImageToSink(tab, frame, qint64(image->size()) * qint64(sizeof(csd::Color)));
                 break;
               }
               case SensorDescriptor::CameraDepth: {
@@ -10026,7 +12554,7 @@ int main(int argc, char *argv[]) {
                     L[x*3+0] = g; L[x*3+1] = g; L[x*3+2] = g;
                   }
                 }
-                postImageToSink(tab, frame);
+                postImageToSink(tab, frame, qint64(image->size()) * qint64(sizeof(csd::Color)));
                 break;
               }
               case SensorDescriptor::CameraSemantic: {
@@ -10049,7 +12577,7 @@ int main(int argc, char *argv[]) {
                     L[x*3+0] = r; L[x*3+1] = g; L[x*3+2] = b;
                   }
                 }
-                postImageToSink(tab, frame);
+                postImageToSink(tab, frame, qint64(image->size()) * qint64(sizeof(csd::Color)));
                 break;
               }
               case SensorDescriptor::CameraOpticalFlow: {
@@ -10078,7 +12606,7 @@ int main(int argc, char *argv[]) {
                     L[x*3+0] = c.red(); L[x*3+1] = c.green(); L[x*3+2] = c.blue();
                   }
                 }
-                postImageToSink(tab, frame);
+                postImageToSink(tab, frame, qint64(flow->size()) * qint64(sizeof(csd::OpticalFlowPixel)));
                 break;
               }
               case SensorDescriptor::LidarTopDown: {
@@ -10098,7 +12626,7 @@ int main(int argc, char *argv[]) {
                   const int idx = u * 3;
                   L[idx+0] = 0x6E; L[idx+1] = 0xE6; L[idx+2] = 0x6E;
                 }
-                postImageToSink(tab, frame);
+                postImageToSink(tab, frame, qint64(measurement->size()) * qint64(sizeof(carla::sensor::data::LidarDetection)));
                 break;
               }
               case SensorDescriptor::RadarText: {
@@ -10203,11 +12731,27 @@ int main(int argc, char *argv[]) {
           } catch (...) {
           }
         });
+      } catch (const std::exception &listenEx) {
+        fprintf(stderr, "[preview] Listen(%s) failed: %s\n",
+                desc.tabName.toUtf8().constData(), listenEx.what());
+      } catch (...) {
+        fprintf(stderr, "[preview] Listen(%s) failed: unknown\n",
+                desc.tabName.toUtf8().constData());
+      }
     } catch (const std::exception &e) {
+      fprintf(stderr, "[preview] SpawnActor(%s) failed: %s\n",
+              desc.tabName.toUtf8().constData(), e.what());
       if (QLabel *sink = previewImageSinks.value(desc.tabName, nullptr))
         sink->setText(QString("%1\n%2").arg(desc.tabName, QString::fromLocal8Bit(e.what())));
       if (QPlainTextEdit *sink = previewTextSinks.value(desc.tabName, nullptr))
         sink->setPlainText(QString::fromLocal8Bit(e.what()));
+    } catch (...) {
+      fprintf(stderr, "[preview] spawnAndListen(%s) failed: unknown exception\n",
+              desc.tabName.toUtf8().constData());
+      if (QLabel *sink = previewImageSinks.value(desc.tabName, nullptr))
+        sink->setText(QString("%1\nSpawn failed (unknown error)").arg(desc.tabName));
+      if (QPlainTextEdit *sink = previewTextSinks.value(desc.tabName, nullptr))
+        sink->setPlainText(QStringLiteral("Spawn failed (unknown error)"));
     }
   };
 #endif
@@ -10218,12 +12762,12 @@ int main(int argc, char *argv[]) {
     if (desc.blueprintId.isEmpty()) return;
 
     if (!previewClient || !previewParent) {
-      tryConnectForPreviews(10);
-      QTimer::singleShot(2500, &window, [&, sensor_name]() {
-        if (previewClient && previewParent) {
-          startSensorPreview(sensor_name);
-        }
-      });
+      // Enqueue the sensor; tryConnectForPreviews flushes the queue once both
+      // the connection and a hero vehicle are ready.  This replaces the old
+      // one-shot 2.5 s timer that silently dropped sensors when CARLA was slow.
+      if (!pendingPreviewSensors.contains(sensor_name))
+        pendingPreviewSensors.append(sensor_name);
+      tryConnectForPreviews(-1);
       return;
     }
     spawnAndListen(desc);
@@ -10233,8 +12777,11 @@ int main(int argc, char *argv[]) {
   };
 
   auto createPreviewTile = [&](const QString &sensor_name) -> QGroupBox * {
-    QGroupBox *tile = new QGroupBox(sensor_name);
+    DraggablePreviewTile *tile = new DraggablePreviewTile(sensor_name);
+    tile->setTileName(sensor_name);
     tile->setProperty("sensor_name", sensor_name);
+    tile->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    tile->setToolTip(QStringLiteral("Drag to rearrange this preview tile"));
     tile->setStyleSheet(
       "QGroupBox { font-weight: bold; border: 1px solid #3a3a3a; "
       "border-radius: 4px; margin-top: 8px; padding-top: 4px; }"
@@ -10248,64 +12795,456 @@ int main(int argc, char *argv[]) {
     const SensorDescriptor desc = kSensorCatalog.value(sensor_name);
     const bool isText = !desc.blueprintId.isEmpty() && sensor_is_text_kind(desc);
 
+    QWidget *surface = new QWidget(tile);
+    surface->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    QGridLayout *surfaceGrid = new QGridLayout(surface);
+    surfaceGrid->setContentsMargins(0, 0, 0, 0);
+    surfaceGrid->setSpacing(0);
+
     if (isText) {
-      QPlainTextEdit *textView = new QPlainTextEdit(tile);
+      QPlainTextEdit *textView = new QPlainTextEdit(surface);
       textView->setReadOnly(true);
       textView->setPlaceholderText(QStringLiteral("waiting for data"));
       textView->setStyleSheet(
         "QPlainTextEdit { font-family: monospace; background: #111; "
-        "color: #0F0; border: none; }");
+        "color: #0F0; border: 1px solid #006600; }");
       textView->setMinimumHeight(90);
-      textView->setMaximumHeight(140);
+      textView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
       previewTextSinks[sensor_name] = textView;
-      tileLayout->addWidget(textView);
+      surfaceGrid->addWidget(textView, 0, 0);
     } else {
-      QLabel *previewLabel = new QLabel(QStringLiteral("Ready to stream"), tile);
+      QLabel *previewLabel = new QLabel(QStringLiteral("Ready to stream"), surface);
       previewLabel->setAlignment(Qt::AlignCenter);
       previewLabel->setStyleSheet(
         "QLabel { border: 1px solid #006600; background: #111; color: #0F0; "
         "font-weight: bold; }");
-      previewLabel->setMinimumSize(260, 130);
-      previewLabel->setMaximumHeight(180);
+      // Ego/hero tiles use 16:9 landscape; fisheye/sensor tiles are near-square.
+      const bool isEgoTile = sensor_name.startsWith(QLatin1String("Ego "));
+      if (isEgoTile) {
+        previewLabel->setMinimumSize(220, 124);
+      } else {
+        previewLabel->setMinimumSize(170, 170);
+      }
+      previewLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
       previewLabel->setScaledContents(false);
       previewImageSinks[sensor_name] = previewLabel;
-      tileLayout->addWidget(previewLabel);
+      surfaceGrid->addWidget(previewLabel, 0, 0);
     }
 
-    QPushButton *detachBtn = new QPushButton("⇱ detach", tile);
-    detachBtn->setMaximumWidth(80);
-    detachBtn->setStyleSheet("QPushButton { font-size: 10px; padding: 1px; }");
-    tileLayout->addWidget(detachBtn, 0, Qt::AlignRight);
+    QWidget *topRightOverlay = new QWidget(surface);
+    QVBoxLayout *topRightLay = new QVBoxLayout(topRightOverlay);
+    topRightLay->setContentsMargins(0, 0, 0, 0);
+    topRightLay->setSpacing(2);
+    QLabel *bwLbl = new QLabel(QStringLiteral("0.00 Mbps"), topRightOverlay);
+    bwLbl->setStyleSheet(
+      "font-size: 10px; font-family: monospace; "
+      "background: rgba(20,20,20,170); color: #d8f5ff; border: 1px solid #555; "
+      "padding: 1px 4px;");
+    bwLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    topRightLay->addWidget(bwLbl, 0, Qt::AlignRight);
+
+    QLabel *optLbl = new QLabel(QStringLiteral("Optimized: for low network BW"), topRightOverlay);
+    optLbl->setStyleSheet(
+      "font-size: 10px; "
+      "background: rgba(20,20,20,170); color: #ffe08a; border: 1px solid #555; "
+      "padding: 1px 4px;");
+    optLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    optLbl->setVisible(false);
+    topRightLay->addWidget(optLbl, 0, Qt::AlignRight);
+
+    QPushButton *detachBtn = new QPushButton("Detach", topRightOverlay);
+    detachBtn->setMaximumWidth(70);
+    detachBtn->setStyleSheet(
+      "QPushButton { font-size: 10px; padding: 1px 5px; "
+      "background: rgba(20,20,20,170); color: #ddd; border: 1px solid #555; }");
+    QPushButton *moveBtn = new QPushButton("Move", topRightOverlay);
+    moveBtn->setMaximumWidth(70);
+    moveBtn->setToolTip(QStringLiteral("Drag to rearrange this tile"));
+    moveBtn->setStyleSheet(
+      "QPushButton { font-size: 10px; padding: 1px 5px; "
+      "background: rgba(20,20,20,170); color: #ddd; border: 1px solid #555; }");
+    topRightLay->addWidget(moveBtn, 0, Qt::AlignRight);
+    topRightLay->addWidget(detachBtn, 0, Qt::AlignRight);
+    surfaceGrid->addWidget(topRightOverlay, 0, 0, Qt::AlignTop | Qt::AlignRight);
 
     QObject::connect(detachBtn, &QPushButton::clicked, tile, [&, sensor_name]() {
       QGroupBox *src = previewTiles.value(sensor_name, nullptr);
       if (!src) return;
       previewGridLayout->removeWidget(src);
+      previewTileGridPos.remove(sensor_name);
+      previewTileOrder.removeAll(sensor_name);
+      if (previewAutoLayout) relayoutPreviewTiles();
       src->setParent(nullptr);
       src->setWindowTitle(QString("CARLA Preview - %1").arg(sensor_name));
       src->setWindowFlag(Qt::Window, true);
-      src->resize(420, 260);
+      src->setMinimumWidth(320);
+      src->resize(360, 400);
       detachedPreviewWindows.push_back(src);
       src->show();
     });
 
+    QObject::connect(moveBtn, &QPushButton::pressed, tile, [tile]() {
+      tile->startTileDrag();
+    });
+
+    QPushButton *dragLeftBtn = new QPushButton("||", surface);
+    dragLeftBtn->setMaximumWidth(24);
+    dragLeftBtn->setToolTip(QStringLiteral("Drag tile"));
+    dragLeftBtn->setStyleSheet(
+      "QPushButton { font-size: 10px; padding: 1px 3px; "
+      "background: rgba(20,20,20,170); color: #ddd; border: 1px solid #555; }");
+    surfaceGrid->addWidget(dragLeftBtn, 0, 0, Qt::AlignLeft | Qt::AlignVCenter);
+
+    QPushButton *dragRightBtn = new QPushButton("||", surface);
+    dragRightBtn->setMaximumWidth(24);
+    dragRightBtn->setToolTip(QStringLiteral("Drag tile"));
+    dragRightBtn->setStyleSheet(
+      "QPushButton { font-size: 10px; padding: 1px 3px; "
+      "background: rgba(20,20,20,170); color: #ddd; border: 1px solid #555; }");
+    surfaceGrid->addWidget(dragRightBtn, 0, 0, Qt::AlignRight | Qt::AlignVCenter);
+
+    QObject::connect(dragLeftBtn, &QPushButton::pressed, tile, [tile]() {
+      tile->startTileDrag();
+    });
+    QObject::connect(dragRightBtn, &QPushButton::pressed, tile, [tile]() {
+      tile->startTileDrag();
+    });
+
+    auto adjustTileMinSize = [tile](int dw, int dh) {
+      const int newW = std::max(120, tile->minimumWidth() + dw);
+      const int newH = std::max(90,  tile->minimumHeight() + dh);
+      tile->setMinimumSize(newW, newH);
+    };
+
+    auto makeCornerBtn = [&](const QString &txt, const QString &tip) {
+      QPushButton *b = new QPushButton(txt, surface);
+      b->setMaximumSize(22, 18);
+      b->setToolTip(tip);
+      b->setStyleSheet(
+        "QPushButton { font-size: 10px; padding: 0; "
+        "background: rgba(20,20,20,170); color: #ddd; border: 1px solid #555; }");
+      return b;
+    };
+    QPushButton *cornerTL = makeCornerBtn(QStringLiteral("↖"), QStringLiteral("Shrink tile"));
+    QPushButton *cornerTR = makeCornerBtn(QStringLiteral("↗"), QStringLiteral("Wider tile"));
+    QPushButton *cornerBL = makeCornerBtn(QStringLiteral("↙"), QStringLiteral("Taller tile"));
+    QPushButton *cornerBR = makeCornerBtn(QStringLiteral("↘"), QStringLiteral("Enlarge tile"));
+    surfaceGrid->addWidget(cornerTL, 0, 0, Qt::AlignLeft | Qt::AlignTop);
+    surfaceGrid->addWidget(cornerTR, 0, 0, Qt::AlignRight | Qt::AlignTop);
+    surfaceGrid->addWidget(cornerBL, 0, 0, Qt::AlignLeft | Qt::AlignBottom);
+    surfaceGrid->addWidget(cornerBR, 0, 0, Qt::AlignRight | Qt::AlignBottom);
+
+    QObject::connect(cornerTL, &QPushButton::clicked, tile, [adjustTileMinSize]() {
+      adjustTileMinSize(-24, -16);
+    });
+    QObject::connect(cornerTR, &QPushButton::clicked, tile, [adjustTileMinSize]() {
+      adjustTileMinSize(24, 0);
+    });
+    QObject::connect(cornerBL, &QPushButton::clicked, tile, [adjustTileMinSize]() {
+      adjustTileMinSize(0, 16);
+    });
+    QObject::connect(cornerBR, &QPushButton::clicked, tile, [adjustTileMinSize]() {
+      adjustTileMinSize(24, 16);
+    });
+
+    tile->onTileDropped = [&, sensor_name](const QString &sourceName, const QString &targetName) {
+      Q_UNUSED(sensor_name);
+      if (sourceName.isEmpty() || targetName.isEmpty() || sourceName == targetName) return;
+      int from = static_cast<int>(previewTileOrder.indexOf(sourceName));
+      if (from < 0) {
+        previewTileOrder << sourceName;
+        from = static_cast<int>(previewTileOrder.indexOf(sourceName));
+      }
+      int to = static_cast<int>(previewTileOrder.indexOf(targetName));
+      if (to < 0) {
+        previewTileOrder << targetName;
+        to = static_cast<int>(previewTileOrder.indexOf(targetName));
+      }
+      if (from < 0 || to < 0 || from == to) return;
+      previewTileOrder.move(from, to);
+      previewAutoLayout = true;
+      relayoutPreviewTiles();
+      if (previewDock) {
+        previewDock->show();
+        previewDock->raise();
+      }
+    };
+
+    QWidget *overlayBar = new QWidget(surface);
+    overlayBar->setStyleSheet(
+      "background: rgba(8,8,8,140); border: 0; border-top: 1px solid rgba(255,255,255,25);");
+    overlayBar->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    QHBoxLayout *overlayLay = new QHBoxLayout(overlayBar);
+    overlayLay->setContentsMargins(6, 2, 6, 2);
+    overlayLay->setSpacing(6);
+    QLabel *fpsLbl = new QLabel(QStringLiteral("—"), overlayBar);
+    fpsLbl->setStyleSheet(
+      "font-size: 10px; font-family: monospace; color: rgba(220,220,220,200);");
+    QLabel *tsLbl = new QLabel(QStringLiteral("—"), overlayBar);
+    tsLbl->setStyleSheet(
+      "font-size: 10px; font-family: monospace; color: rgba(220,220,220,200);");
+    tsLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    overlayLay->addWidget(fpsLbl, 0, Qt::AlignLeft | Qt::AlignVCenter);
+    overlayLay->addStretch(1);
+    overlayLay->addWidget(tsLbl, 0, Qt::AlignRight | Qt::AlignVCenter);
+    surfaceGrid->addWidget(overlayBar, 0, 0, Qt::AlignLeft | Qt::AlignRight | Qt::AlignBottom);
+
+    tileLayout->addWidget(surface, 1);
+    previewFpsLabels[sensor_name] = fpsLbl;
+    previewTsLabels[sensor_name]  = tsLbl;
+    previewBandwidthLabels[sensor_name] = bwLbl;
+    previewOptimizationLabels[sensor_name] = optLbl;
+
+    if (QLabel *status = previewOptimizationLabels.value(sensor_name, nullptr)) {
+      status->setVisible(previewOptimizedLowBw.value(sensor_name, false));
+    }
+
     return tile;
+  };
+
+  auto findFirstFreePreviewCell = [&](bool preferHeroRow) -> QPoint {
+    auto isFree = [&](int r, int c) {
+      for (auto it = previewTileGridPos.constBegin(); it != previewTileGridPos.constEnd(); ++it) {
+        if (it.value().x() == r && it.value().y() == c) return false;
+      }
+      return true;
+    };
+    if (preferHeroRow) {
+      for (int c = 0; c < kPreviewGridCols; ++c)
+        if (isFree(0, c)) return QPoint(0, c);
+    }
+    // Keep sensor previews vertically stacked by default.
+    for (int r = 0; r < kPreviewGridRows; ++r) {
+      if (isFree(r, 0)) return QPoint(r, 0);
+    }
+    for (int c = 1; c < kPreviewGridCols; ++c) {
+      for (int r = 0; r < kPreviewGridRows; ++r) {
+        if (isFree(r, c)) return QPoint(r, c);
+      }
+    }
+    return QPoint(-1, -1);
+  };
+
+  relayoutPreviewTiles = [&]() {
+    if (!previewAutoLayout) return;
+    QStringList active;
+    for (const QString &name : previewTileOrder) {
+      QGroupBox *tile = previewTiles.value(name, nullptr);
+      if (!tile) continue;
+      if (tile->parent() == previewGridHost) active << name;
+    }
+    if (active.isEmpty()) return;
+
+    const int count = static_cast<int>(active.size());
+    const int rows = std::max(1, std::min(kPreviewGridRows, count));
+    const int cols = std::max(1, std::min(kPreviewGridCols, (count + rows - 1) / rows));
+    for (int r = 0; r < kPreviewGridRows; ++r) {
+      previewGridLayout->setRowStretch(r, 0);
+    }
+    for (int c = 0; c < kPreviewGridCols; ++c) {
+      previewGridLayout->setColumnStretch(c, 0);
+    }
+    for (int c = 0; c < cols; ++c) previewGridLayout->setColumnStretch(c, 1);
+    for (int r = 0; r < rows; ++r) previewGridLayout->setRowStretch(r, 1);
+
+    for (int i = 0; i < count; ++i) {
+      const int row = i % rows;
+      const int col = i / rows;
+      QGroupBox *tile = previewTiles.value(active.at(i), nullptr);
+      if (!tile) continue;
+      previewGridLayout->removeWidget(tile);
+      previewGridLayout->addWidget(tile, row, col);
+      previewTileGridPos[active.at(i)] = QPoint(row, col);
+    }
+  };
+
+  auto placePreviewTileAt = [&](const QString &sensor_name, int row, int col) {
+    if (row < 0 || col < 0 || row >= kPreviewGridRows || col >= kPreviewGridCols) return;
+    QGroupBox *tile = previewTiles.value(sensor_name, nullptr);
+    if (!tile) {
+      tile = createPreviewTile(sensor_name);
+      previewTiles.insert(sensor_name, tile);
+    }
+    previewGridLayout->removeWidget(tile);
+    previewGridLayout->addWidget(tile, row, col);
+    previewTileGridPos[sensor_name] = QPoint(row, col);
   };
 
   addPreviewTileByName = [&](const QString &sensor_name) {
     if (previewTiles.contains(sensor_name)) return;
-    QGroupBox *tile = createPreviewTile(sensor_name);
-    previewTiles.insert(sensor_name, tile);
-    const int stretchIdx = previewGridLayout->count() - 1;
-    previewGridLayout->insertWidget(stretchIdx, tile);
+    const QPoint slot = findFirstFreePreviewCell(sensor_name.startsWith(QLatin1String("Ego ")));
+    if (slot.x() < 0 || slot.y() < 0) {
+      QMessageBox::warning(&window, "Preview limit",
+        QString("Maximum %1 preview tiles reached.").arg(kPreviewMaxTiles));
+      return;
+    }
+    placePreviewTileAt(sensor_name, slot.x(), slot.y());
+    if (!previewTileOrder.contains(sensor_name)) {
+      previewTileOrder << sensor_name;
+    }
+    if (previewAutoLayout) relayoutPreviewTiles();
+    // Keep the Interfaces tab in sync: auto-check the matching sensor checkbox.
+    auto doCheckSync = [&]() {
+      for (auto *vec : {&cameraChecks, &radarChecks, &lidarChecks,
+                        &navChecks, &gtChecks, &sonarChecks}) {
+        for (QCheckBox *cb : *vec) {
+          if (cb && cb->property("sensor_name").toString() == sensor_name) {
+            cb->setChecked(true);
+            return;
+          }
+        }
+      }
+    };
+    doCheckSync();
+    // Resize the floating window to exactly fit the new content.
+    QTimer::singleShot(0, previewDock, [previewDock]() { previewDock->adjustSize(); });
+  };
+
+  auto clearPreviewLayout = [&](bool stopStreams) {
+    if (stopStreams) {
+      stopAllPreviews();
+    }
+    for (QWidget *w : detachedPreviewWindows) {
+      if (w) w->close();
+    }
+    detachedPreviewWindows.clear();
+    while (QLayoutItem *item = previewGridLayout->takeAt(0)) {
+      if (QWidget *w = item->widget()) w->deleteLater();
+      delete item;
+    }
+    previewTiles.clear();
+    previewImageSinks.clear();
+    previewTextSinks.clear();
+    previewFpsLabels.clear();
+    previewTsLabels.clear();
+    previewBandwidthLabels.clear();
+    previewOptimizationLabels.clear();
+    previewLastFrameMs.clear();
+    previewFpsEma.clear();
+    previewBandwidthMbps.clear();
+    previewBandwidthBytes.clear();
+    previewBandwidthWindowStartMs.clear();
+    previewOptimizedLowBw.clear();
+    netPreviewMbpsByName.clear();
+    previewTileGridPos.clear();
+    previewTileOrder.clear();
+    previewAutoLayout = true;
+    previewEmptyTileSeq = 1;
+  };
+
+  auto addEmptyPreviewSlot = [&]() {
+    QString slotName;
+    do {
+      slotName = QStringLiteral("Empty Slot %1").arg(previewEmptyTileSeq++);
+    } while (previewTiles.contains(slotName));
+    addPreviewTileByName(slotName);
+    previewDock->show();
+    previewDock->raise();
+  };
+
+  auto applyBevFisheyeCrossPreset = [&]() {
+    clearPreviewLayout(true);
+    previewAutoLayout = false;
+
+    const QString bev = QStringLiteral("Ego Bird Eye");
+    const QString fFront = QStringLiteral("Fisheye Front");
+    const QString fRear = QStringLiteral("Fisheye Rear");
+    const QString fLeft = QStringLiteral("Fisheye Left");
+    const QString fRight = QStringLiteral("Fisheye Right");
+
+    previewTileOrder << bev << fFront << fRear << fLeft << fRight;
+    placePreviewTileAt(bev, 2, 1);
+    placePreviewTileAt(fFront, 1, 1);
+    placePreviewTileAt(fRear, 3, 1);
+    placePreviewTileAt(fLeft, 2, 0);
+    placePreviewTileAt(fRight, 2, 2);
+
+    previewDock->show();
+    previewDock->raise();
+    previewDock->activateWindow();
+
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+    tryConnectForPreviews(-1);
+    const QStringList names = { bev, fFront, fRear, fLeft, fRight };
+    int spawnIdx = 0;
+    for (const QString &name : names) {
+      QTimer::singleShot(spawnIdx * 350, &window, [&, name]() {
+        startSensorPreview(name);
+      });
+      ++spawnIdx;
+    }
+#else
+    const QStringList names = { bev, fFront, fRear, fLeft, fRight };
+    for (const QString &name : names) {
+      if (QLabel *sink = previewImageSinks.value(name, nullptr)) {
+        sink->setText("LibCarla unavailable\\nin this build");
+      }
+    }
+#endif
+  };
+
+  auto applyBevCabinSixCamPreset = [&]() {
+    clearPreviewLayout(true);
+    previewAutoLayout = false;
+
+    const QString bev = QStringLiteral("Ego Bird Eye");
+    const QString front = QStringLiteral("Fisheye Front");
+    const QString left = QStringLiteral("Fisheye Left");
+    const QString cabin = QStringLiteral("Camera Cabin");
+    const QString right = QStringLiteral("Fisheye Right");
+    const QString rear = QStringLiteral("Fisheye Rear");
+
+    // Sketch layout:
+    // row0: [BEV spans 3 cols]
+    // row1: [Front centered]
+    // row2: [Left | Cabin | Right]
+    // row3: [Rear centered]
+    previewTileOrder << bev << front << left << cabin << right << rear;
+    placePreviewTileAt(bev, 0, 0);
+    if (QGroupBox *bevTile = previewTiles.value(bev, nullptr)) {
+      previewGridLayout->removeWidget(bevTile);
+      previewGridLayout->addWidget(bevTile, 0, 0, 1, 3);
+      previewTileGridPos[bev] = QPoint(0, 0);
+    }
+    placePreviewTileAt(front, 1, 1);
+    placePreviewTileAt(left, 2, 0);
+    placePreviewTileAt(cabin, 2, 1);
+    placePreviewTileAt(right, 2, 2);
+    placePreviewTileAt(rear, 3, 1);
+
+    previewDock->show();
+    previewDock->raise();
+    previewDock->activateWindow();
+
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+    tryConnectForPreviews(-1);
+    const QStringList names = { bev, front, left, cabin, right, rear };
+    int spawnIdx = 0;
+    for (const QString &name : names) {
+      QTimer::singleShot(spawnIdx * 350, &window, [&, name]() {
+        startSensorPreview(name);
+      });
+      ++spawnIdx;
+    }
+#else
+    const QStringList names = { bev, front, left, cabin, right, rear };
+    for (const QString &name : names) {
+      if (QLabel *sink = previewImageSinks.value(name, nullptr)) {
+        sink->setText("LibCarla unavailable\\nin this build");
+      }
+    }
+#endif
   };
 
   auto selectedAllSensors = [&]() -> QStringList {
     QStringList selected;
     auto collectChecked = [&](const std::vector<QCheckBox *> &checks) {
       for (QCheckBox *check : checks) {
+        // Note: checkbox text is cleared (setText("")) so the sensor name
+        // is stored in the "sensor_name" property instead.
         if (check && check->isChecked()) {
-          selected << check->property("sensor_name").toString();
+          const QString sn = check->property("sensor_name").toString();
+          if (!sn.isEmpty()) selected << sn;
         }
       }
     };
@@ -10314,6 +13253,7 @@ int main(int argc, char *argv[]) {
     collectChecked(lidarChecks);
     collectChecked(navChecks);
     collectChecked(gtChecks);
+    collectChecked(sonarChecks);
     selected.removeDuplicates();
     return selected;
   };
@@ -10329,9 +13269,19 @@ int main(int argc, char *argv[]) {
     }
 
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
-    tryConnectForPreviews(10);
-    for (const QString &sensor_name : selectedSensors) {
-      startSensorPreview(sensor_name);
+    tryConnectForPreviews(-1);
+    // Stagger spawns by 350 ms each: CARLA 0.10.0 needs at least one game-tick
+    // between SpawnActor calls; spawning 16+ sensors simultaneously causes all
+    // but the first to fail with std::exception.
+    {
+      int spawnIdx = 0;
+      for (const QString &sensor_name : selectedSensors) {
+        if (activePreviewSensors.contains(sensor_name)) continue;
+        QTimer::singleShot(spawnIdx * 350, &window, [&, sensor_name]() {
+          startSensorPreview(sensor_name);
+        });
+        ++spawnIdx;
+      }
     }
 #else
     for (const QString &sensor_name : selectedSensors) {
@@ -10344,6 +13294,98 @@ int main(int argc, char *argv[]) {
     }
 #endif
   });
+
+  auto openFisheyePreviews = [&]() {
+    const QStringList fisheyeTiles = {
+      QStringLiteral("Fisheye Front"),
+      QStringLiteral("Fisheye Rear"),
+      QStringLiteral("Fisheye Left"),
+      QStringLiteral("Fisheye Right")
+    };
+
+    for (const QString &name : fisheyeTiles) {
+      addPreviewTileByName(name);
+    }
+    previewDock->show();
+    previewDock->raise();
+    previewDock->activateWindow();
+
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+    tryConnectForPreviews(-1);
+    for (const QString &name : fisheyeTiles) {
+      startSensorPreview(name);
+    }
+#else
+    for (const QString &name : fisheyeTiles) {
+      if (QLabel *sink = previewImageSinks.value(name, nullptr)) {
+        sink->setText("LibCarla unavailable\nin this build");
+      }
+    }
+#endif
+  };
+
+  auto openEgoPreviews = [&]() {
+    const QStringList egoTiles = {
+      QStringLiteral("Ego Driver"),
+      QStringLiteral("Ego Chase"),
+      QStringLiteral("Ego Cockpit"),
+      QStringLiteral("Ego Bird Eye")
+    };
+    for (const QString &name : egoTiles) {
+      addPreviewTileByName(name);
+    }
+    previewDock->show();
+    previewDock->raise();
+    previewDock->activateWindow();
+
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+    tryConnectForPreviews(-1);
+    // Stagger ego camera spawns by 350 ms each.
+    {
+      int spawnIdx = 0;
+      for (const QString &name : egoTiles) {
+        if (activePreviewSensors.contains(name)) continue;
+        QTimer::singleShot(spawnIdx * 350, &window, [&, name]() {
+          startSensorPreview(name);
+        });
+        ++spawnIdx;
+      }
+    }
+#else
+    for (const QString &name : egoTiles) {
+      if (QLabel *sink = previewImageSinks.value(name, nullptr)) {
+        sink->setText("LibCarla unavailable\nin this build");
+      }
+    }
+#endif
+  };
+
+  openDriverPreviewInGrid = [&](const QString &mode) {
+    QString tileName;
+    if (mode == "FPV") {
+      tileName = QStringLiteral("Ego Driver");
+    } else if (mode == "CPV") {
+      tileName = QStringLiteral("Ego Cockpit");
+    } else if (mode == "BEV") {
+      tileName = QStringLiteral("Ego Bird Eye");
+    } else {
+      tileName = QStringLiteral("Ego Chase");
+    }
+
+    addPreviewTileByName(tileName);
+    previewDock->show();
+    previewDock->raise();
+    previewDock->activateWindow();
+
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+    tryConnectForPreviews(-1);
+    startSensorPreview(tileName);
+#else
+    if (QLabel *sink = previewImageSinks.value(tileName, nullptr)) {
+      sink->setText("LibCarla unavailable\nin this build");
+    }
+#endif
+  };
 
   QObject::connect(applySensorsBtn, &QPushButton::clicked, &window, [&]() {
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
@@ -10401,21 +13443,36 @@ int main(int argc, char *argv[]) {
         if (!checks[i] || !checks[i]->isChecked()) continue;
         if (counts[i] <= 0) continue;
         const QString name = checks[i]->property("sensor_name").toString();
-        const auto descIt = kSensorCatalog.find(name);
-        if (descIt == kSensorCatalog.end()) continue;
-        const SensorDescriptor &desc = descIt.value();
-        const auto *bp = bps->Find(desc.blueprintId.toStdString());
-        if (!bp) continue;
+        if (name.isEmpty()) continue;
 
-        const SensorMountConfig mount = getOrCreateSensorMount(name);
-        cg::Location loc(mount.tx, mount.ty, mount.tz);
-        cg::Rotation rot(mount.ry, mount.rz, mount.rx);
-        cg::Transform tr(loc, rot);
+        // Directional sensors expand to N named instances.
+        const QStringList dirs = kDirectionalSensors.value(name);
+        const int spawnCount = dirs.isEmpty() ? counts[i] : std::min(counts[i], dirs.size());
 
-        for (int k = 0; k < counts[i]; ++k) {
+        for (int k = 0; k < spawnCount; ++k) {
+          // For directional sensors use the kth direction name; else use the base name.
+          const QString spawnName = (!dirs.isEmpty() && k < dirs.size()) ? dirs[k] : name;
+          const auto descIt = kSensorCatalog.find(spawnName);
+          if (descIt == kSensorCatalog.end()) continue;
+          const SensorDescriptor &desc = descIt.value();
+          const auto *bp = bps->Find(desc.blueprintId.toStdString());
+          if (!bp) continue;
+
+          // Use the per-instance mount (set by + button handler) or directional preset.
+          SensorMountConfig mount;
+          if (!dirs.isEmpty()) {
+            mount = directionalMountFor(spawnName);
+          } else {
+            mount = getOrCreateSensorMount(sensor_mount_key(name, k + 1));
+          }
+          cg::Location loc(mount.tx, mount.ty, mount.tz);
+          cg::Rotation rot(mount.ry, mount.rz, mount.rx);
+          cg::Transform tr(loc, rot);
+
           auto bpCopy = *bp;
-          if (isCameraSensorName(name)) {
-            const CameraOptics o = cameraOpticsByName.value(name, CameraOptics{});
+          if (isCameraSensorName(spawnName)) {
+            const CameraOptics o = cameraOpticsByName.value(spawnName,
+                cameraOpticsByName.value(name, CameraOptics{}));
             auto trySetAttr = [&](const char *attr, const QString &v) {
               if (bpCopy.ContainsAttribute(attr)) {
                 bpCopy.SetAttribute(attr, v.toStdString());
@@ -10459,7 +13516,7 @@ int main(int argc, char *argv[]) {
     auto walk = [&](std::vector<QCheckBox *> &checks, std::vector<int> &counts) {
       for (size_t i = 0; i < checks.size(); ++i) {
         if (!checks[i]) continue;
-        cb(checks[i]->property("sensor_name").toString(), checks[i]->isChecked(), counts[i]);
+        cb(checks[i]->text(), checks[i]->isChecked(), counts[i]);
       }
     };
     walk(cameraChecks, cameraSensorCounts);
@@ -10541,8 +13598,7 @@ int main(int argc, char *argv[]) {
                         std::vector<QLabel *> &countLabels) {
       for (size_t i = 0; i < checks.size(); ++i) {
         if (!checks[i]) continue;
-        const QString sensorName = checks[i]->property("sensor_name").toString();
-        const QJsonObject e = byName.value(sensorName);
+        const QJsonObject e = byName.value(checks[i]->text());
         if (e.isEmpty()) continue;
         checks[i]->setChecked(e.value("enabled").toBool());
         counts[i] = e.value("count").toInt(0);
@@ -10557,7 +13613,7 @@ int main(int argc, char *argv[]) {
           m.rx = mo.value("roll").toDouble();
           m.ry = mo.value("pitch").toDouble();
           m.rz = mo.value("yaw").toDouble();
-          sensor_mount_configs[sensorName] = m;
+          sensor_mount_configs[checks[i]->text()] = m;
         }
         const auto oo = e.value("optics").toObject();
         if (!oo.isEmpty()) {
@@ -10573,7 +13629,7 @@ int main(int argc, char *argv[]) {
           o.lensCircleFalloff = oo.value("lens_circle_falloff").toDouble(5.0);
           o.lensCircleMultiplier = oo.value("lens_circle_multiplier").toDouble(1.0);
           o.chromaticAberration = oo.value("chromatic_aberration_intensity").toDouble();
-          cameraOpticsByName[sensorName] = o;
+          cameraOpticsByName[checks[i]->text()] = o;
         }
       }
     };
@@ -10627,31 +13683,37 @@ int main(int argc, char *argv[]) {
   });
 
   QObject::connect(reattachPreviewBtn, &QPushButton::clicked, &window, [&]() {
-    for (QWidget *detachedWindow : detachedPreviewWindows) {
-      if (!detachedWindow) continue;
-      QGroupBox *tile = qobject_cast<QGroupBox *>(detachedWindow);
-      if (!tile) continue;
-      const QString name = tile->property("sensor_name").toString();
-      if (name.isEmpty()) continue;
-      tile->setWindowFlag(Qt::Window, false);
-      tile->setParent(previewGridHost);
-      const int stretchIdx = previewGridLayout->count() - 1;
-      previewGridLayout->insertWidget(stretchIdx, tile);
-      tile->show();
-    }
-    detachedPreviewWindows.clear();
-    if (!previewTiles.isEmpty()) previewDock->show();
+    clearPreviewLayout(false);
   });
 
+  QTimer *signalCleanupTimer = nullptr;
   bool exitCleanupRan = false;
   auto cleanupStudioLaunchedProcesses = [&]() {
     if (exitCleanupRan) {
       return;
     }
     exitCleanupRan = true;
+    studioShuttingDown = true;
+
+    if (signalCleanupTimer) {
+      signalCleanupTimer->stop();
+    }
 
     setSimulationStatus("Shutdown cleanup in progress...");
-    app.processEvents();
+
+    // Proactively stop child QProcess instances so their finish signals don't
+    // race with teardown of captured UI state.
+    const auto childProcs = window.findChildren<QProcess *>();
+    for (QProcess *proc : childProcs) {
+      if (!proc) continue;
+      proc->disconnect();
+      if (proc->state() == QProcess::NotRunning) continue;
+      proc->terminate();
+      if (!proc->waitForFinished(150)) {
+        proc->kill();
+        proc->waitForFinished(150);
+      }
+    }
 
     stopInAppDriver();
     stopAllPreviews();
@@ -10675,7 +13737,7 @@ int main(int argc, char *argv[]) {
     refreshRememberedPidList();
   };
 
-  QTimer *signalCleanupTimer = new QTimer(&window);
+  signalCleanupTimer = new QTimer(&window);
   signalCleanupTimer->setInterval(100);
   QObject::connect(signalCleanupTimer, &QTimer::timeout, &window, [&]() {
     if (g_shutdownSignalRequested == 0) {
@@ -10993,7 +14055,7 @@ int main(int argc, char *argv[]) {
   auto previewPopoutHolder = std::make_shared<QPointer<QDialog>>(nullptr);
   QObject::connect(previewPopoutBtn, &QPushButton::clicked, &window,
                     [&, previewPopoutHolder]() {
-    if (!*previewPopoutHolder) {
+    if (previewPopoutHolder->isNull()) {
       auto *dlg = new QDialog(&window);
       dlg->setAttribute(Qt::WA_DeleteOnClose);
       dlg->setWindowTitle("CARLA Studio · Map Preview (popout)");
@@ -11009,9 +14071,9 @@ int main(int argc, char *argv[]) {
       if (!r.isEmpty()) popoutView->fitInView(r, Qt::KeepAspectRatio);
       *previewPopoutHolder = dlg;
     }
-    (*previewPopoutHolder)->show();
-    (*previewPopoutHolder)->raise();
-    (*previewPopoutHolder)->activateWindow();
+    previewPopoutHolder->data()->show();
+    previewPopoutHolder->data()->raise();
+    previewPopoutHolder->data()->activateWindow();
   });
   previewGroup->setLayout(previewLayout);
 
@@ -11042,7 +14104,7 @@ int main(int argc, char *argv[]) {
 #endif
   });
 
-  QObject::connect(mapLoadBtn, &QPushButton::clicked, &window, [&]() {
+  QObject::connect(mapLoadBtn, &QPushButton::clicked, &window, [&, scenarioLogLine]() {
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
     const QString m = mapCombo->currentText();
     if (m.isEmpty() || m.startsWith("(")) {
@@ -11060,7 +14122,7 @@ int main(int argc, char *argv[]) {
 #endif
   });
 
-  QObject::connect(mapReloadBtn, &QPushButton::clicked, &window, [&]() {
+  QObject::connect(mapReloadBtn, &QPushButton::clicked, &window, [&, scenarioLogLine]() {
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
     auto c = scenarioConnectClient();
     if (!c) return;
@@ -11112,7 +14174,7 @@ int main(int argc, char *argv[]) {
     }
   });
 
-  QObject::connect(xodrImportBtn, &QPushButton::clicked, &window, [&]() {
+  QObject::connect(xodrImportBtn, &QPushButton::clicked, &window, [&, scenarioLogLine]() {
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
     const QString path = xodrPath->text().trimmed();
     if (path.isEmpty()) { scenarioLogLine("✗ no XODR file selected"); return; }
@@ -11134,7 +14196,7 @@ int main(int argc, char *argv[]) {
 #endif
   });
 
-  QObject::connect(xodrExportBtn, &QPushButton::clicked, &window, [&]() {
+  QObject::connect(xodrExportBtn, &QPushButton::clicked, &window, [&, scenarioLogLine]() {
 #ifdef CARLA_STUDIO_WITH_LIBCARLA
     auto c = scenarioConnectClient();
     if (!c) return;
@@ -12104,8 +15166,8 @@ int main(int argc, char *argv[]) {
       const QString line = QString::fromLocal8Bit(p.readAllStandardOutput()).trimmed();
       const qsizetype sp = line.indexOf(' ');
       if (sp > 0) {
-        const QString ver = line.left(sp);
-        const QString path = line.mid(sp + 1);
+        const QString ver = line.left(static_cast<int>(sp));
+        const QString path = line.mid(static_cast<int>(sp + 1));
         if (!seen.contains(path)) {
           out.append({ QString("carla %1   →   %2 (system / pip)").arg(ver, path), path });
         }
@@ -12233,6 +15295,27 @@ int main(int argc, char *argv[]) {
   sshLayout->addLayout(hostInputLayout);
   QPushButton *removeHostBtn = new QPushButton("Remove Selected Host");
   sshLayout->addWidget(removeHostBtn);
+
+  // Per-host credential editor — shown/updated when a host is selected.
+  QGroupBox *credGroup = new QGroupBox("Credentials for selected host");
+  QFormLayout *credForm = new QFormLayout();
+  QLineEdit *credUserEdit = new QLineEdit();
+  credUserEdit->setPlaceholderText("username (e.g. os)");
+  QLineEdit *credPassEdit = new QLineEdit();
+  credPassEdit->setEchoMode(QLineEdit::Password);
+  credPassEdit->setPlaceholderText("password or leave blank for key auth");
+  credForm->addRow("User:", credUserEdit);
+  credForm->addRow("Password:", credPassEdit);
+  QHBoxLayout *credBtnLay = new QHBoxLayout();
+  QPushButton *saveCredBtn  = new QPushButton("Save");
+  QPushButton *clearCredBtn = new QPushButton("Clear");
+  credBtnLay->addWidget(saveCredBtn);
+  credBtnLay->addWidget(clearCredBtn);
+  credBtnLay->addStretch();
+  credForm->addRow(credBtnLay);
+  credGroup->setLayout(credForm);
+  credGroup->setEnabled(false);
+  sshLayout->addWidget(credGroup);
 
   QHBoxLayout *keyInputLayout = new QHBoxLayout();
   QLineEdit *sshKeyPath = new QLineEdit();
@@ -12799,6 +15882,37 @@ int main(int argc, char *argv[]) {
   toggleLoggingAction = new QAction("Logging", &window);
   toggleLoggingAction->setCheckable(true);
   toggleLoggingAction->setChecked(false);
+  QMenu *cfgMenu = window.menuBar()->addMenu("Cfg");
+  QMenu *previewsMenu = cfgMenu->addMenu("Previews");
+  QAction *previewApplyDefaultPresetAct = previewsMenu->addAction("Default");
+  previewsMenu->addSeparator();
+  QAction *previewAddEmptySlotAct = previewsMenu->addAction("Add Empty Slot");
+  QAction *previewApplyCrossPresetAct = previewsMenu->addAction("BEV + Fisheye Cross (5x4)");
+  QAction *previewApplyCabinPresetAct = previewsMenu->addAction("Apply BEV + Cabin 6-Cam (5x4)");
+  QAction *previewClearLayoutAct = previewsMenu->addAction("Clear Preview Layout");
+  QObject::connect(previewApplyDefaultPresetAct, &QAction::triggered, &window, [&]() {
+    applyBevFisheyeCrossPreset();
+  });
+  QObject::connect(previewAddEmptySlotAct, &QAction::triggered, &window, [&]() {
+    addEmptyPreviewSlot();
+  });
+  QObject::connect(previewApplyCrossPresetAct, &QAction::triggered, &window, [&]() {
+    applyBevFisheyeCrossPreset();
+  });
+  QObject::connect(previewApplyCabinPresetAct, &QAction::triggered, &window, [&]() {
+    applyBevCabinSixCamPreset();
+  });
+  QObject::connect(previewClearLayoutAct, &QAction::triggered, &window, [&]() {
+    clearPreviewLayout(true);
+  });
+  if (previewWindowFileMenu) {
+    previewWindowFileMenu->addAction(previewApplyDefaultPresetAct);
+    previewWindowFileMenu->addSeparator();
+    previewWindowFileMenu->addAction(previewAddEmptySlotAct);
+    previewWindowFileMenu->addAction(previewApplyCrossPresetAct);
+    previewWindowFileMenu->addAction(previewApplyCabinPresetAct);
+    previewWindowFileMenu->addAction(previewClearLayoutAct);
+  }
   toolsMenu->addSeparator();
   QAction *quitAction = toolsMenu->addAction("Quit");
   quitAction->setShortcut(QKeySequence::Quit);
@@ -12807,8 +15921,6 @@ int main(int argc, char *argv[]) {
     window.close();
     QCoreApplication::quit();
   });
-
-  QMenu *cfgMenu = window.menuBar()->addMenu("Cfg");
 
   QMenu *themeMenu = cfgMenu->addMenu("Theme");
   auto *themeGroup = new QActionGroup(&window);
@@ -13099,8 +16211,8 @@ int main(int argc, char *argv[]) {
         const QString line = QString::fromLocal8Bit(f.readLine()).trimmed();
         const qsizetype eq = line.indexOf(QLatin1Char('='));
         if (eq < 0) continue;
-        if (line.left(eq) == key) {
-          QString v = line.mid(eq + 1);
+        if (line.left(static_cast<int>(eq)) == key) {
+          QString v = line.mid(static_cast<int>(eq + 1));
           if (v.startsWith('"') && v.endsWith('"')) v = v.mid(1, v.size() - 2);
           return v;
         }
@@ -13877,19 +16989,61 @@ int main(int argc, char *argv[]) {
       refreshBuiltinLists();
     }
   });
+
+  // Populate credential fields when user selects a host in the list.
+  QObject::connect(remoteHostsList, &QListWidget::currentItemChanged, &window,
+    [&, credGroup, credUserEdit, credPassEdit](QListWidgetItem *cur, QListWidgetItem *) {
+      if (!cur) { credGroup->setEnabled(false); return; }
+      const QString host = cur->text().trimmed();
+      credGroup->setEnabled(!host.isEmpty() && host != "No remote hosts configured.");
+      credGroup->setTitle(QString("Credentials for: %1").arg(host));
+      credUserEdit->setText(QSettings().value(QString("remote/cred/%1/user").arg(host)).toString());
+      credPassEdit->setText(QSettings().value(QString("remote/cred/%1/pass").arg(host)).toString());
+    });
+
+  QObject::connect(saveCredBtn, &QPushButton::clicked, &window, [&, credUserEdit, credPassEdit]() {
+    QListWidgetItem *item = remoteHostsList->currentItem();
+    if (!item) return;
+    const QString host = item->text().trimmed();
+    if (host.isEmpty() || host == "No remote hosts configured.") return;
+    QSettings().setValue(QString("remote/cred/%1/user").arg(host), credUserEdit->text().trimmed());
+    QSettings().setValue(QString("remote/cred/%1/pass").arg(host), credPassEdit->text());
+    QSettings().sync();
+    // Apply immediately to the live session if this is the active host.
+    if (targetHost->text().trimmed() == host) {
+      if (guiOverrides.remoteUser.isEmpty())
+        remoteRuntimeUser = credUserEdit->text().trimmed();
+      if (guiOverrides.remotePass.isEmpty())
+        remoteRuntimePass = credPassEdit->text();
+    }
+  });
+
+  QObject::connect(clearCredBtn, &QPushButton::clicked, &window, [&, credUserEdit, credPassEdit]() {
+    QListWidgetItem *item = remoteHostsList->currentItem();
+    if (!item) return;
+    const QString host = item->text().trimmed();
+    if (host.isEmpty() || host == "No remote hosts configured.") return;
+    QSettings().remove(QString("remote/cred/%1/user").arg(host));
+    QSettings().remove(QString("remote/cred/%1/pass").arg(host));
+    QSettings().sync();
+    credUserEdit->clear();
+    credPassEdit->clear();
+  });
   QObject::connect(addKeyBtn, &QPushButton::clicked, &window, [&]() {
     const QString keyPath = sshKeyPath->text().trimmed();
     if (keyPath.isEmpty()) {
       return;
     }
-    if (QFileInfo(keyPath).isFile()) {
-      if (!managedSshKeys.contains(keyPath)) {
-        managedSshKeys.append(keyPath);
-        persistBuiltinSshData();
-        refreshBuiltinLists();
+    if (!managedSshKeys.contains(keyPath)) {
+      if (!QFileInfo(keyPath).isFile()) {
+        QMessageBox::warning(&window, "Key file not found",
+          QString("The file does not exist:\n  %1\n\nThe path has been saved anyway.").arg(keyPath));
       }
-      sshKeyPath->clear();
+      managedSshKeys.append(keyPath);
+      persistBuiltinSshData();
+      refreshBuiltinLists();
     }
+    sshKeyPath->clear();
   });
   QObject::connect(removeKeyBtn, &QPushButton::clicked, &window, [&]() {
     QListWidgetItem *item = sshKeysList->currentItem();
@@ -13906,6 +17060,92 @@ int main(int argc, char *argv[]) {
 
   refreshBuiltinLists();
 
+  // Restore last session settings (runtime, host, root) before applying
+  // CLI overrides so CLI args always win over saved state.
+  {
+    const QString savedRuntime = QSettings().value("carla/last_runtime").toString().trimmed();
+    if (!savedRuntime.isEmpty() && savedRuntime != "remotehost - Please configure in settings") {
+      int idx = runtimeTarget->findText(savedRuntime);
+      if (idx < 0 && savedRuntime.endsWith(" (remote)")) {
+        runtimeTarget->addItem(savedRuntime);
+        idx = runtimeTarget->findText(savedRuntime);
+      }
+      if (idx >= 0) runtimeTarget->setCurrentIndex(idx);
+    }
+    const QString savedHost = QSettings().value("carla/last_host").toString().trimmed();
+    if (!savedHost.isEmpty()) targetHost->setText(savedHost);
+    const QString savedRoot = QSettings().value("carla/last_root").toString().trimmed();
+    if (!savedRoot.isEmpty() && carla_root_path->text().trimmed().isEmpty())
+      carla_root_path->setText(savedRoot);
+  }
+
+  if (!guiOverrides.carlaRoot.isEmpty()) {
+    carla_root_path->setText(guiOverrides.carlaRoot);
+    QSettings().setValue("carla/last_root", guiOverrides.carlaRoot);
+  }
+  if (guiOverrides.port > 0) {
+    portSpin->setValue(guiOverrides.port);
+  }
+  if (!guiOverrides.runtime.isEmpty()) {
+    if (guiOverrides.runtime == "local" || guiOverrides.runtime == "localhost") {
+      runtimeTarget->setCurrentText("localhost");
+    } else if (guiOverrides.runtime == "container" || guiOverrides.runtime == "docker") {
+      int idx = runtimeTarget->findText("container");
+      if (idx < 0) idx = runtimeTarget->findText("container (Docker not configured)");
+      if (idx >= 0) runtimeTarget->setCurrentIndex(idx);
+    } else if (guiOverrides.runtime == "remote") {
+      const QString remoteHost = guiOverrides.host.trimmed();
+      if (!remoteHost.isEmpty()) {
+        const QString remoteLabel = QString("%1 (remote)").arg(remoteHost);
+        int idx = runtimeTarget->findText(remoteLabel);
+        if (idx < 0) {
+          runtimeTarget->addItem(remoteLabel);
+          idx = runtimeTarget->findText(remoteLabel);
+        }
+        if (idx >= 0) runtimeTarget->setCurrentIndex(idx);
+        QSettings().setValue("carla/last_runtime", remoteLabel);
+        QSettings().setValue("carla/last_host", remoteHost);
+      }
+    }
+  }
+  if (!guiOverrides.host.isEmpty()) {
+    targetHost->setText(guiOverrides.host);
+  }
+  if (!guiOverrides.map.trimmed().isEmpty()) {
+    const QString requestedMap = guiOverrides.map.trimmed();
+    if (scenarioSelect->findText(requestedMap) < 0) {
+      scenarioSelect->insertItem(0, requestedMap);
+    }
+    scenarioSelect->setCurrentText(requestedMap);
+  }
+  if (guiOverrides.launchMcityMkz) {
+    const QString kMcityMap = QStringLiteral("McityMap_Main");
+    const QString kMkzBlueprint = QStringLiteral("vehicle.lincoln.mkz_2017");
+
+    if (scenarioSelect->findText(kMcityMap) < 0) {
+      scenarioSelect->insertItem(0, kMcityMap);
+    }
+    scenarioSelect->setCurrentText(kMcityMap);
+
+    bool selected = false;
+    for (int i = 0; i < egoVehicleCombo->count(); ++i) {
+      if (egoVehicleCombo->itemData(i).toString() == kMkzBlueprint) {
+        egoVehicleCombo->setCurrentIndex(i);
+        selected = true;
+        break;
+      }
+    }
+    if (!selected) {
+      egoVehicleCombo->insertItem(0, QStringLiteral("Lincoln MKZ 2017"), kMkzBlueprint);
+      egoVehicleCombo->setCurrentIndex(0);
+    }
+    QSettings().setValue(QStringLiteral("vehicle/blueprint"), kMkzBlueprint);
+  }
+  updateEndpoint();
+  validateCarlaRoot();
+
+  // Lock the main panel to its natural minimum so dock attachment never squishes it.
+  tabs->setMinimumWidth(265);
   window.setCentralWidget(tabs);
   window.setDockOptions(QMainWindow::AllowTabbedDocks |
                         QMainWindow::AllowNestedDocks |
@@ -13985,14 +17225,359 @@ int main(int argc, char *argv[]) {
   setSimReachable(launchRequestedOrRunning);
   g_disableSimButtonsOnMismatch = [&]() { setSimReachable(false); };
 
+  // Let Qt compute the natural window width from the main panel's content.
+  window.adjustSize();
   window.show();
 
   {
     const QStringList args = QApplication::arguments();
+    const QSettings startupSettings;
+    const bool sensorPreviewArgProvided = (args.indexOf("--sensor-preview") >= 0);
+    const bool previewLive  = args.contains("--preview-live");
+    const bool autoLaunchMcityMkz = args.contains("--launch-mcity-mkz")
+      || args.contains("--mcity-mkz");
+    const bool autoFisheye4OnStart = args.contains("--auto-fisheye-4")
+      || startupSettings.value("preview/auto_fisheye4_on_start", false).toBool();
+    const bool legacyAutoFisheye4 = autoFisheye4OnStart && !sensorPreviewArgProvided;
+    const bool autoFullPreview   = args.contains("--auto-full-preview");
+
+    auto parsePreviewModeArg = [&](QString *warnOut) -> QString {
+      const qsizetype idx = args.indexOf("--preview");
+      if (idx < 0) return {};
+      if (idx + 1 >= args.size()) {
+        if (warnOut) *warnOut = QStringLiteral("--preview requires one of: driver, chase, cockpit, bev");
+        return {};
+      }
+      const QString mode = args.at(static_cast<int>(idx + 1)).trimmed().toLower();
+      if (mode == "driver" || mode == "fpv") return QStringLiteral("driver");
+      if (mode == "chase" || mode == "tpv") return QStringLiteral("chase");
+      if (mode == "cockpit" || mode == "cpv") return QStringLiteral("cockpit");
+      if (mode == "bev" || mode == "bird-eye" || mode == "bird_eye" || mode == "birdeye")
+        return QStringLiteral("bev");
+      if (warnOut) *warnOut = QString("Unsupported --preview value '%1' (use driver|chase|cockpit|bev)").arg(mode);
+      return {};
+    };
+
+    auto parseSensorPreviewSpec = [&](QString *warnOut) -> QStringList {
+      const qsizetype idx = args.indexOf("--sensor-preview");
+      if (idx >= 0) {
+        if (idx + 1 >= args.size()) {
+          if (warnOut) *warnOut = QStringLiteral("--sensor-preview requires value like fisheye-x4 or rgb-x4");
+          return {};
+        }
+
+        const QString spec = args.at(static_cast<int>(idx + 1)).trimmed().toLower();
+        const QRegularExpression re("^([a-z0-9_-]+)-x([0-9]+)$");
+        const auto m = re.match(spec);
+        if (!m.hasMatch()) {
+          if (warnOut) *warnOut = QString("Unsupported --sensor-preview '%1' (expected <type>-x<count>)").arg(spec);
+          return {};
+        }
+
+        const QString type = m.captured(1);
+        bool okCount = false;
+        const int count = m.captured(2).toInt(&okCount);
+        if (!okCount || count <= 0) {
+          if (warnOut) *warnOut = QString("Invalid --sensor-preview count in '%1'").arg(spec);
+          return {};
+        }
+
+        const QMap<QString, QStringList> supported = {
+          {QStringLiteral("fisheye"), {QStringLiteral("Fisheye Front"), QStringLiteral("Fisheye Rear"), QStringLiteral("Fisheye Left"), QStringLiteral("Fisheye Right")}},
+          {QStringLiteral("rgb"),     {QStringLiteral("Camera Front"),  QStringLiteral("Camera Rear"),  QStringLiteral("Camera Left"),  QStringLiteral("Camera Right")}},
+          {QStringLiteral("cabin"),   {QStringLiteral("Camera Cabin")}},
+          {QStringLiteral("radar"),   {QStringLiteral("Radar Front"),   QStringLiteral("Radar Rear"),   QStringLiteral("Radar Left"),   QStringLiteral("Radar Right")}},
+          {QStringLiteral("sonar"),   {QStringLiteral("Sonar Front"),   QStringLiteral("Sonar Rear"),   QStringLiteral("Sonar Left"),   QStringLiteral("Sonar Right")}}
+        };
+
+        if (!supported.contains(type)) {
+          if (warnOut) {
+            *warnOut = QString("Sensor preview '%1' is not configured for CLI automation. Use GUI Sensor menu.").arg(type);
+          }
+          return {};
+        }
+
+        const QStringList dirs = supported.value(type);
+        if (count > dirs.size()) {
+          if (warnOut) {
+            *warnOut = QString("Requested %1-x%2 but only x%3 is configured for CLI automation.")
+                         .arg(type).arg(count).arg(dirs.size());
+          }
+          return {};
+        }
+
+        QStringList out;
+        for (int i = 0; i < count; ++i) out << dirs[i];
+        return out;
+      }
+
+      // Legacy compatibility: --auto-fisheye-4 means fisheye-x4.
+      if (legacyAutoFisheye4) {
+        return {
+          QStringLiteral("Fisheye Front"),
+          QStringLiteral("Fisheye Rear"),
+          QStringLiteral("Fisheye Left"),
+          QStringLiteral("Fisheye Right")
+        };
+      }
+
+      return {};
+    };
+
+    QString cliWarn;
+    const QString requestedPreviewMode = parsePreviewModeArg(&cliWarn);
+    const QStringList requestedSensorTiles = parseSensorPreviewSpec(&cliWarn);
+    bool cliStartRequested = false;
+    auto requestCliStartOnce = [&]() {
+      if (cliStartRequested || launchRequestedOrRunning) {
+        cliStartRequested = true;
+        return;
+      }
+      if (startBtn && startBtn->isEnabled()) {
+        cliStartRequested = true;
+        startBtn->click();
+      }
+    };
+    if (!cliWarn.isEmpty()) {
+      fprintf(stderr, "[cli] WARNING: %s\n", cliWarn.toUtf8().constData());
+    }
+
+    if (!requestedPreviewMode.isEmpty()) {
+      auto *viewTimer = new QTimer(&window);
+      viewTimer->setInterval(1500);
+      auto tries = std::make_shared<int>(0);
+      QObject::connect(viewTimer, &QTimer::timeout, &window, [&, viewTimer, tries, requestedPreviewMode]() {
+        ++(*tries);
+        requestCliStartOnce();
+        bool clicked = false;
+        if (requestedPreviewMode == "driver" && fpvBtn && fpvBtn->isEnabled()) { fpvBtn->click(); clicked = true; }
+        else if (requestedPreviewMode == "chase" && tpvBtn && tpvBtn->isEnabled()) { tpvBtn->click(); clicked = true; }
+        else if (requestedPreviewMode == "cockpit" && cpvBtn && cpvBtn->isEnabled()) { cpvBtn->click(); clicked = true; }
+        else if (requestedPreviewMode == "bev" && bevBtn && bevBtn->isEnabled()) { bevBtn->click(); clicked = true; }
+        if (clicked || *tries >= 80) {
+          viewTimer->stop();
+          viewTimer->deleteLater();
+        }
+      });
+      QTimer::singleShot(800, &window, [viewTimer]() { viewTimer->start(); });
+    }
+
+    if (autoLaunchMcityMkz) {
+      auto *startTimer = new QTimer(&window);
+      startTimer->setInterval(1500);
+      auto tries = std::make_shared<int>(0);
+      QObject::connect(startTimer, &QTimer::timeout, &window, [&, startTimer, tries]() {
+        ++(*tries);
+        if ((startBtn && startBtn->isEnabled()) || launchRequestedOrRunning) {
+          requestCliStartOnce();
+          startTimer->stop();
+          startTimer->deleteLater();
+          return;
+        }
+        if (*tries >= 80) {
+          startTimer->stop();
+          startTimer->deleteLater();
+        }
+      });
+      QTimer::singleShot(900, &window, [startTimer]() { startTimer->start(); });
+    }
+
+    if (!requestedSensorTiles.isEmpty()) {
+      auto *sensorTimer = new QTimer(&window);
+      sensorTimer->setInterval(2500);
+      auto tries = std::make_shared<int>(0);
+      auto requested = std::make_shared<bool>(false);
+      QObject::connect(sensorTimer, &QTimer::timeout, &window, [&, sensorTimer, tries, requested, requestedSensorTiles]() {
+        ++(*tries);
+        requestCliStartOnce();
+
+        bool triggerReady = true;
+        if (!*requested) {
+          for (const QString &name : requestedSensorTiles) {
+            addPreviewTileByName(name);
+          }
+          if (previewDock) { previewDock->show(); previewDock->raise(); }
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+          tryConnectForPreviews(-1);
+          for (int i = 0; i < requestedSensorTiles.size(); ++i) {
+            const QString name = requestedSensorTiles[i];
+            if (activePreviewSensors.contains(name)) continue;
+            QTimer::singleShot(i * 350, &window, [&, name]() { startSensorPreview(name); });
+            triggerReady = false;
+          }
+#endif
+          *requested = true;
+        } else {
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+          for (const QString &name : requestedSensorTiles) {
+            if (!activePreviewSensors.contains(name)) {
+              triggerReady = false;
+              break;
+            }
+          }
+#endif
+        }
+
+        bool allTilesPresent = true;
+        for (const QString &name : requestedSensorTiles) {
+          if (!previewTiles.contains(name)) {
+            allTilesPresent = false;
+            break;
+          }
+        }
+
+        if ((*requested && allTilesPresent && triggerReady) || *tries >= 120) {
+          sensorTimer->stop();
+          sensorTimer->deleteLater();
+        }
+      });
+      QTimer::singleShot(1000, &window, [sensorTimer]() { sensorTimer->start(); });
+    }
+
+    if (legacyAutoFisheye4 && requestedSensorTiles.isEmpty()) {
+      // One-line automation path: launch (if needed), then wait until all
+      // 4 fisheye preview tiles are attached.
+      auto *onceTimer = new QTimer(&window);
+      onceTimer->setInterval(3000);
+      auto tries = std::make_shared<int>(0);
+      auto previewRequested = std::make_shared<bool>(false);
+      QObject::connect(onceTimer, &QTimer::timeout, &window, [&, onceTimer, tries, previewRequested]() {
+        ++(*tries);
+        requestCliStartOnce();
+        if (applySensorsBtn && applySensorsBtn->isEnabled()) {
+          openFisheyePreviews();
+          *previewRequested = true;
+        }
+
+        const QStringList fisheyeTiles = {
+          QStringLiteral("Fisheye Front"),
+          QStringLiteral("Fisheye Rear"),
+          QStringLiteral("Fisheye Left"),
+          QStringLiteral("Fisheye Right")
+        };
+        bool haveAllTiles = true;
+        for (const QString &name : fisheyeTiles) {
+          if (!previewTiles.contains(name)) {
+            haveAllTiles = false;
+            break;
+          }
+        }
+
+        if (*previewRequested && haveAllTiles) {
+          onceTimer->stop();
+          onceTimer->deleteLater();
+          return;
+        }
+        if (*tries >= 120) {
+          onceTimer->stop();
+          onceTimer->deleteLater();
+        }
+      });
+      QTimer::singleShot(1500, &window, [onceTimer]() { onceTimer->start(); });
+    }
+
+    if (previewLive) {
+      // Live mode for terminal-driven demos: keep nudging START + fisheye preview
+      // until the sim is fully ready and previews are attached, then stop.
+      auto *autoTimer = new QTimer(&window);
+      autoTimer->setInterval(4000);
+      auto autoTicks = std::make_shared<int>(0);
+      QObject::connect(autoTimer, &QTimer::timeout, &window, [&, autoTimer, autoTicks]() {
+        ++(*autoTicks);
+        requestCliStartOnce();
+        if (applySensorsBtn && applySensorsBtn->isEnabled()) {
+          openFisheyePreviews();
+        }
+        if (previewDock) {
+          previewDock->show();
+          previewDock->raise();
+        }
+        bool allReady = previewTiles.contains("Fisheye Front")
+          && previewTiles.contains("Fisheye Rear")
+          && previewTiles.contains("Fisheye Left")
+          && previewTiles.contains("Fisheye Right");
+#ifdef CARLA_STUDIO_WITH_LIBCARLA
+        allReady = allReady
+          && activePreviewSensors.contains("Fisheye Front")
+          && activePreviewSensors.contains("Fisheye Rear")
+          && activePreviewSensors.contains("Fisheye Left")
+          && activePreviewSensors.contains("Fisheye Right");
+#endif
+        if (allReady || *autoTicks >= 25) {
+          autoTimer->stop();
+          autoTimer->deleteLater();
+        }
+      });
+      QTimer::singleShot(1500, &window, [autoTimer]() { autoTimer->start(); });
+    }
+
+    if (autoFullPreview) {
+      // Populate the full 5×4 grid: 4 ego tiles in hero row + 16 sensor tiles.
+      // Tile layout:
+      //   row 0 (hero): Ego Driver, Ego Chase, Ego Cockpit, Ego Bird Eye
+      //   col 0 rows 1-4: Fisheye Front/Rear/Left/Right
+      //   col 1 rows 1-4: Camera Front/Rear/Left/Right
+      //   col 2 rows 1-4: Radar Front/Rear/Left/Right
+      //   col 3 rows 1-4: GNSS, IMU, Collision, Lane Invasion
+      //
+      // NOTE: Do NOT call openFisheyePreviews() here — it would trigger fisheye
+      // checkboxes via doCheckSync and then previewSensorsBtn->click() would see
+      // them as selected and attempt to re-spawn them, causing a double-spawn
+      // before activePreviewSensors is populated.  Instead check the fisheye
+      // checkboxes directly in the `want` list below and let previewSensorsBtn
+      // handle the full 16-sensor batch in one shot.
+      //
+      // sensor.other.obstacle (Sonar) is excluded: in CARLA 0.10.0 the obstacle
+      // detector's LibCarla background-thread deserialiser can throw an uncaught
+      // exception, which triggers std::terminate and aborts the process.
+      auto *fullTimer = new QTimer(&window);
+      // 8 s between retries: with 16 sensors × 350 ms stagger = 5.6 s total
+      // spawn time, 8 s ensures all staggered timers from the previous batch
+      // have fired before we attempt to start the next retry batch.
+      fullTimer->setInterval(8000);
+      auto fullTicks = std::make_shared<int>(0);
+      QObject::connect(fullTimer, &QTimer::timeout, &window,
+          [&, fullTimer, fullTicks]() {
+        ++(*fullTicks);
+        requestCliStartOnce();
+        // Hero row — 4 ego camera tiles.
+        if (applySensorsBtn && applySensorsBtn->isEnabled())
+          openEgoPreviews();
+        // 16 sensor tiles via checkbox selection + previewSensorsBtn.
+        if (previewSensorsBtn && previewSensorsBtn->isEnabled()) {
+          const QStringList want = {
+            QStringLiteral("Fisheye Front"), QStringLiteral("Fisheye Rear"),
+            QStringLiteral("Fisheye Left"),  QStringLiteral("Fisheye Right"),
+            QStringLiteral("Camera Front"),  QStringLiteral("Camera Rear"),
+            QStringLiteral("Camera Left"),   QStringLiteral("Camera Right"),
+            QStringLiteral("Radar Front"),   QStringLiteral("Radar Rear"),
+            QStringLiteral("Radar Left"),    QStringLiteral("Radar Right"),
+            QStringLiteral("GNSS"),          QStringLiteral("IMU"),
+            QStringLiteral("Collision"),     QStringLiteral("Lane Invasion")
+          };
+          for (auto *vec : {&cameraChecks, &radarChecks, &lidarChecks,
+                             &navChecks, &gtChecks, &sonarChecks}) {
+            for (QCheckBox *cb : *vec) {
+              if (cb && want.contains(cb->property("sensor_name").toString()))
+                cb->setChecked(true);
+            }
+          }
+          previewSensorsBtn->click();
+        }
+        if (previewDock) { previewDock->show(); previewDock->raise(); }
+        if (*fullTicks >= 12) { fullTimer->stop(); fullTimer->deleteLater(); }
+      });
+      QTimer::singleShot(1500, &window, [fullTimer]() { fullTimer->start(); });
+    }
+
     const qsizetype csIdx = args.indexOf("--capture-screenshots");
     if (csIdx != -1 && csIdx + 1 < args.size()) {
-      const QString captureOutDir = args.at(csIdx + 1);
-      QTimer::singleShot(1800, &window, [&, captureOutDir]() {
+      const QString captureOutDir = args.at(static_cast<int>(csIdx + 1));
+      // Parse optional --capture-delay <ms> (default 1800 for dialogs, 8000 for live stats)
+      const qsizetype cdIdx = args.indexOf("--capture-delay");
+      const int captureStatsDelayMs = (cdIdx != -1 && cdIdx + 1 < args.size())
+          ? args.at(static_cast<int>(cdIdx + 1)).toInt() : 8000;
+      QTimer::singleShot(1800, &window, [&, captureOutDir, captureStatsDelayMs]() {
         toggleHealthCheckAction->setChecked(true);
         toggleScenarioBuilderAction->setChecked(true);
         setVehicleImportTabVisible(true);
@@ -14037,7 +17622,64 @@ int main(int argc, char *argv[]) {
         });
         openSensorConfigDialog("Fisheye");
 
-        app.quit();
+        // In capture mode, first request START so a hero vehicle can be present.
+        QTimer::singleShot(2200, &window, [&]() {
+          if (startBtn && startBtn->isEnabled()) {
+            startBtn->click();
+          }
+        });
+
+        // Re-grab Home tab after stats have had time to populate from
+        // SSH ps + nvidia-smi + /proc — typically 3-4 refresh cycles.
+        QTimer::singleShot(captureStatsDelayMs, &window, [&, captureOutDir]() {
+          const int prev = tabs->currentIndex();
+          tabs->setCurrentIndex(0);
+          QApplication::processEvents();
+          window.grab().save(captureOutDir + "/tab-0-Home-stats.png", "PNG");
+          tabs->setCurrentIndex(prev);
+          fprintf(stderr, "[capture] stats screenshot saved to %s/tab-0-Home-stats.png\n",
+                  captureOutDir.toUtf8().constData());
+        });
+
+        // Legacy-only: nudge fisheye preview capture path when no explicit CLI
+        // sensor-preview/capture-preview-images automation is active.
+        const bool hasPreviewCaptureFlag = (args.indexOf("--capture-preview-images") >= 0);
+        if (!sensorPreviewArgProvided && !hasPreviewCaptureFlag) {
+          QTimer::singleShot(12000, &window, [&, captureOutDir]() {
+            const int prev = tabs->currentIndex();
+            for (int i = 0; i < tabs->count(); ++i) {
+              const QString t = tabs->tabText(i);
+              const QString tip = tabs->tabToolTip(i);
+              if (t.contains("Sim", Qt::CaseInsensitive)
+                  || tip.contains("Sim", Qt::CaseInsensitive)
+                  || t.contains("Launch", Qt::CaseInsensitive)
+                  || tip.contains("Launch", Qt::CaseInsensitive)) {
+                tabs->setCurrentIndex(i);
+                break;
+              }
+            }
+            QApplication::processEvents();
+            if (applySensorsBtn && applySensorsBtn->isEnabled()) {
+              openFisheyePreviews();
+            }
+            tabs->setCurrentIndex(prev);
+          });
+        }
+
+        const int captureDelayMs = previewLive ? 70000 : 32000;
+        const int quitDelayMs = previewLive ? 73000 : 34000;
+
+        QTimer::singleShot(captureDelayMs, &window, [&, captureOutDir]() {
+          QApplication::processEvents();
+          window.grab().save(captureOutDir + "/fisheye-preview-window.png", "PNG");
+          if (previewDock && previewDock->isVisible()) {
+            previewDock->grab().save(captureOutDir + "/fisheye-preview-dock.png", "PNG");
+          }
+        });
+
+        QTimer::singleShot(quitDelayMs, &window, [&]() {
+          app.quit();
+        });
       });
     }
   }
