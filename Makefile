@@ -36,7 +36,6 @@ _UNREAL_ABS      := $(abspath $(UNREAL_DIR))
 _CARLA_SIM_STAMP := $(_CARLA_BUILD)/.carla-studio-setup-done
 
 $(_CARLA_SIM_STAMP):
-	@rm -rf "$(_CARLA_BUILD)"
 	CARLA_UNREAL_ENGINE_PATH="$(_UNREAL_ABS)" \
 	cmake -S "$(CARLA_DIR)" -B "$(_CARLA_BUILD)" \
 	  -DCMAKE_BUILD_TYPE=Release \
@@ -46,10 +45,11 @@ $(_CARLA_SIM_STAMP):
 	  -DBUILD_CARLA_UNREAL=ON \
 	  -DBUILD_PYTHON_API=ON \
 	  -DBUILD_OSM2ODR=OFF \
-	  -DENABLE_ROS2=OFF
-	cmake --build "$(_CARLA_BUILD)" --target carla-client       -j$(JOBS)
-	cmake --build "$(_CARLA_BUILD)" --target carla-unreal       -j$(JOBS)
-	cmake --build "$(_CARLA_BUILD)" --target carla-unreal-editor -j$(JOBS)
+	  -DENABLE_ROS2=OFF \
+	  -DCARLA_UNREAL_PACKAGE_NO_COMPRESSION=ON \
+	  -DCARLA_UNREAL_PACKAGE_MAPS=/Game/Carla/Maps/Town01_Opt
+	CARLA_UNREAL_ENGINE_PATH="$(_UNREAL_ABS)" cmake --build "$(_CARLA_BUILD)" --target carla-client                  -j$(JOBS)
+	CARLA_UNREAL_ENGINE_PATH="$(_UNREAL_ABS)" cmake --build "$(_CARLA_BUILD)" --target carla-unreal-package-shipping -j$(JOBS)
 	@touch "$(_CARLA_SIM_STAMP)"
 
 $(_CARLA_LIB): $(_CARLA_SIM_STAMP)
