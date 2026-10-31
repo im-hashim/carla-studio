@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <string>
+#include <vector>
 #include <QApplication>
 #include <QDir>
 #include <QFile>
@@ -93,6 +95,17 @@ int main(int argc, char *argv[]) {
     const QStringList args = app.arguments();
     const bool updateDocs = args.contains("--update-documentation");
 
+    // Strip --update-documentation so QTest::qExec never sees it.
+    std::vector<std::string> filteredStorage;
+    std::vector<char *>      filteredArgv;
+    for (int i = 0; i < argc; ++i) {
+        if (QLatin1String(argv[i]) != QLatin1String("--update-documentation")) {
+            filteredStorage.push_back(argv[i]);
+            filteredArgv.push_back(filteredStorage.back().data());
+        }
+    }
+    int filteredArgc = static_cast<int>(filteredArgv.size());
+
     const QString display = qEnvironmentVariable("DISPLAY", ":0");
     QTextStream(stdout) << "[test-suite] DISPLAY=" << display << "\n";
 
@@ -113,11 +126,11 @@ int main(int argc, char *argv[]) {
     int exit_code = 0;
 
     QTextStream(stdout) << "\n=== CLI pipeline tests ===\n";
-    runCliPipelineTests(argc, argv, exit_code);
+    runCliPipelineTests(filteredArgc, filteredArgv.data(), exit_code);
 
     int gui_code = 0;
     QTextStream(stdout) << "\n=== GUI matrix tests ===\n";
-    runGuiMatrixTests(argc, argv, gui_code);
+    runGuiMatrixTests(filteredArgc, filteredArgv.data(), gui_code);
     exit_code |= gui_code;
 
     if (updateDocs) {
